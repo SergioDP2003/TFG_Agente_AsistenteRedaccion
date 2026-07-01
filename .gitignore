@@ -1,6 +1,6 @@
 .env
-state_guardado.json
-realted_works.tex
+src/state_guardado.json
+related_works.tex
 
 __pycache__/
 *.py[cod]
