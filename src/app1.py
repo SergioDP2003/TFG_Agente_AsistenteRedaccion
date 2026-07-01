@@ -6,6 +6,7 @@ from typing import Dict, TypedDict, List, Union, Annotated, Sequence, Optional
 from pypdf import PdfReader
 from collections import defaultdict
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -13,11 +14,24 @@ from langgraph.prebuilt import ToolNode
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv()
 
 llm = ChatOllama(model="llama3.2:3b", temperature=0.1)
+llm2 = ChatOllama(model="qwen2.5:7b", temperature=0.1)
+llm3 = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0.3, 
+    max_tokens=None,
+    timeout=None,
+    max_retries=2,
+)
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+
+    idioma_salida: str
 
     tema_paper: str
     trabajos_pdf: List[str]
@@ -42,6 +56,8 @@ class AgentState(TypedDict):
     descripcion_tabla: str
     conclusion_related_work: str
 
+    related_works_document: str
+
     error: Optional[str]
 
 class PaperEstructurado(BaseModel):
@@ -64,6 +80,8 @@ class PropuestaCategorias(BaseModel):
 
 analisis_llm = llm.with_structured_output(PaperEstructurado)
 categorias_llm = llm.with_structured_output(PropuestaCategorias)
+
+categorias_llm3 = llm3.with_structured_output(PropuestaCategorias)
 
 # -------------------------------- METODOS AUXILIARES -------------------------------------
 
@@ -131,42 +149,215 @@ def estructuras_similares(e1, e2, umbral=0.7):
 
     return similitud >= umbral
 
+def guardar_documento_latex(state: dict, nombre_archivo: str = "related_works.tex"):
+    """
+    Extrae el contenido de 'related_works_document' del estado del agente
+    y lo guarda en un archivo con extensión .tex en formato UTF-8.
+    """
+    # 1. Extraemos el texto en LaTeX del diccionario de estado
+    codigo_latex = state.get("related_works_document", "")
+    
+    if not codigo_latex:
+        print("⚠️ No se encontró contenido en 'related_works_document' para guardar.")
+        return False
+        
+    try:
+        # 2. Abrimos y escribimos el archivo asegurando codificación UTF-8
+        with open(nombre_archivo, "w", encoding="utf-8") as archivo:
+            archivo.write(codigo_latex)
+            
+        print(f"💾 ¡Archivo LaTeX guardado con éxito! -> {nombre_archivo}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error al guardar el archivo .tex: {e}")
+        return False
+
 # ------------------------------------ NODOS --------------------------------------------------
 
-def definir_tematica_node(state: AgentState):
-    print("\n--- 📝 PASO 1: TEMÁTICA ---")
-    tema = input("¿Sobre qué trata tu paper? (Ej: IA en medicina):\n> ")
-    return {
-        "tema_paper": tema,
-        "messages": [HumanMessage(content=f"Tema: {tema}")]
+def seleccionar_idioma_node(state: AgentState) -> AgentState:
+    """
+    Nodo 0: Seleccionar Idioma de Salida (Tarea de Usuario - Interactivo)
+    Anclado al inicio del grafo para definir el idioma global del manuscrito.
+    """
+    # Diccionario de mapeo rápido para estandarizar la entrada
+    mapa_idiomas = {
+        "1": "Español académico",
+        "2": "Inglés académico (English)"
     }
 
+    while True:
+        
+        opcion = input().strip()
+
+        if opcion in mapa_idiomas:
+            idioma_elegido = mapa_idiomas[opcion]
+            
+            # Mensajes en primera persona para el feed conversacional
+            texto_humano = f"Opción {opcion}: Prefiero el documento final en {idioma_elegido}."
+            texto_agente = f"Idioma global fijado en {idioma_elegido}. Toda la suite de redacción y la compilación final de LaTeX se ejecutarán bajo esta directriz."
+            texto_agente2 = f"Se procede con la definición del paper desarrollado. Debes describir detalladamente de qué trata tu paper, su metodología y qué aporta (Ej: Un framework llamado SimulateIoT-Services...)"
+
+            return {
+                "idioma_salida": idioma_elegido,  # Nueva clave para tu AgentState
+                "error": None,
+                "messages": [
+                    HumanMessage(content=texto_humano),
+                    AIMessage(content=texto_agente),
+                    AIMessage(content=texto_agente2)
+                ]
+            }
+        else:
+            print("⚠️ Opción inválida. Por favor, introduce un número del 1 al 2.")
+
+def definir_tematica_node(state: AgentState) -> AgentState:
+
+    # Capturamos la descripción del usuario
+    tema_usuario = input()
+    
+    prompt = f"""
+    Analiza la descripción del paper que está escribiendo el usuario. Tu tarea es extraer y rellenar la ficha técnica formal de SU propia investigación utilizando el esquema estructurado. Infere los aspectos técnicos basándote en su explicación.
+    
+    Descripción del usuario:
+    "{tema_usuario}"
+    """
+    
+    try:
+        # Forzamos al LLM a escupir la estructura idéntica a la de los papers analizados
+        llm_estructurado = llm.with_structured_output(PaperEstructurado)
+        res_pydantic = llm_estructurado.invoke(prompt)
+        
+        # Guardamos como diccionario estándar
+        metadatos_dict = res_pydantic.model_dump()
+
+        mensaje_agente = f"Temática del paper recibida correctamente. Realizando un análisis y estructuración de la información."
+        mensaje_agente2 = f"Ficha técnica generada: {json.dumps(metadatos_dict, ensure_ascii=False)}.\n"
+        mensaje_agente3 = f"Se procede a la búsqueda de los PDFs..."
+        
+        return {
+            "tema_paper": metadatos_dict,
+            "messages": [
+                HumanMessage(content=f"Descripción inicial: {tema_usuario}"),
+                AIMessage(content=mensaje_agente),
+                AIMessage(content=mensaje_agente2),
+                AIMessage(content=mensaje_agente3)
+            ]
+        }
+        
+    except Exception as e:
+        print(f"⚠️ Error al estructurar la temática: {e}")
+        # Fallback estructural seguro para que el grafo jamás se rompa si falla el parsing
+        fallback_dict = {
+            "titulo": "Propuesta de Investigación",
+            "autores": ["El Autor"],
+            "anio": "2026",
+            "problema_especifico": tema_usuario,
+            "metodologia_detallada": "Enfoque basado en agentes e inteligencia artificial.",
+            "aportaciones_clave": "Automatización del proceso de desarrollo.",
+            "limitaciones_criticas": "Dependencia del modelo de lenguaje base.",
+            "casos_uso": ["Entornos académicos"]
+        }
+        return {
+            "tema_paper": fallback_dict,
+            "messages": [
+                HumanMessage(content=f"Tema (Fallback Estructurado): {tema_usuario}"),
+                AIMessage(content="No se pudo parsear el formato estructurado. Se activa la ficha técnica de emergencia.")
+            ]
+        }
+
 def buscar_pdfs_node(state: AgentState):
-    print("\n--- 📂 PASO 2: BUSCANDO PDFs ---")
     carpeta = "trabajos_relacionados"
     if not os.path.exists(carpeta):
         os.makedirs(carpeta)
-        return {"error": f"Crea la carpeta '{carpeta}' y añade los PDFs.", "messages": [AIMessage(content="Carpeta creada, pero vacía.")]}
+        mensaje_error = (
+            f"Alerta del sistema: La carpeta '{carpeta}' no existía y ha sido creada automáticamente.\n"
+            f"Por favor, añade los PDFs de los trabajos relacionados que deseas analizar en ella y vuelve a ejecutar el agente."
+        )
+        return {
+            "error": f"Crea la carpeta '{carpeta}' y añade los PDFs.", 
+            "messages": [AIMessage(content=mensaje_error)]
+        }
     
     archivos = [os.path.join(carpeta, f) for f in os.listdir(carpeta) if f.endswith(".pdf")]
-    print(f"Encontrados: {len(archivos)} archivos.")
-    return {"trabajos_pdf": archivos, "messages": [AIMessage(content=f"Encontrados {len(archivos)} PDFs.")]}
+    num_archivos = len(archivos)
+    if num_archivos == 0:
+        mensaje_salida = (
+            f"Exploración completada: Se localizó la carpeta '{carpeta}', pero está completamente vacía.\n"
+            f"Asegúrate de arrastrar tus documentos científicos (.pdf) a esa ruta para poder proceder con el análisis. Se debe reiniciar el agente"
+        )
+    else:
+        # Generamos una lista visual de los ficheros encontrados para que el usuario sepa cuáles se van a leer
+        lista_ficheros = "\n".join([f"   📄 - {os.path.basename(f)}" for f in archivos])
+        mensaje_salida = (
+            f"Exploración completada con éxito. Se han indexado {num_archivos} documentos para su lectura:\n"
+            f"{lista_ficheros}\n\n"
+        )
+
+        mensaje_salida2 = f"Procediendo a la extracción de texto y metadatos..."
+        
+    return {
+        "trabajos_pdf": archivos, 
+        "messages": [
+            AIMessage(content=mensaje_salida),
+            AIMessage(content=mensaje_salida2)
+        ]
+    }
 
 def leer_texto_node(state: AgentState):
-    print("\n--- 📖 PASO 3: LEYENDO CONTENIDO ---")
     textos = []
-    for ruta in state["trabajos_pdf"]:
+    archivos_procesados = []
+    errores = []
+    
+    # Recorremos las rutas indexadas en el nodo anterior
+    for ruta in state.get("trabajos_pdf", []):
+        nombre_archivo = os.path.basename(ruta)
         try:
             reader = PdfReader(ruta)
+            # Extraemos el texto de cada página de manera eficiente
             contenido = " ".join([page.extract_text() for page in reader.pages if page.extract_text()])
             textos.append(contenido.strip())
+            archivos_procesados.append(nombre_archivo)
         except Exception as e:
-            print(f"Error leyendo {ruta}: {e}")
-    return {"textos_trabajos": textos}
+            errores.append(f"❌ {nombre_archivo}: {str(e)}")
+            print(f"⚠️ Error interno leyendo {nombre_archivo}: {e}")
+
+    # --- CONSTRUCCIÓN DEL MENSAJE CONVERSACIONAL ---
+    lineas_reporte = []
+    
+    if archivos_procesados:
+        lineas_reporte.append("📖 Extracción de texto completada en los siguientes manuscritos:")
+        for archivo in archivos_procesados:
+            lineas_reporte.append(f"   ✅ {archivo}")
+            
+    if errores:
+        lineas_reporte.append("\n⚠️ Se presentaron inconvenientes con algunos archivos:")
+        for err in errores:
+            lineas_reporte.append(f"   {err}")
+            
+    if not textos:
+        mensaje_final = (
+            "Error en el proceso: No se pudo extraer texto de ningún PDF.\n"
+            "Asegúrate de que los archivos no estén corruptos o protegidos contra lectura."
+        )
+    else:
+        mensaje_final = (
+            "\n".join(lineas_reporte) + 
+            f"\n\nMemoria de texto cargada correctamente ({len(textos)} fuentes listas).\n"
+        )
+
+    mensaje_salida = f"Procediendo al análisis y estructuración de los datos científicos..."
+
+    return {
+        "textos_trabajos": textos, 
+        "messages": [
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_salida)
+        ] 
+    }
 
 def analizar_trabajos_node(state: AgentState):
-    print(f"\n--- 🤖 ANALIZANDO {len(state['textos_trabajos'])} TRABAJOS ---")
     analizados = []
+    reporte_titulos = []
     
     structured_llm = llm.with_structured_output(PaperEstructurado)
     
@@ -189,18 +380,39 @@ TEXTO:
 """
         
         try:
-            res = structured_llm.invoke(prompt)
-            
-            data = res.dict()
+            res = structured_llm.invoke(prompt)  
+            data = res.model_dump()
+
             if "falta de memoria a largo plazo" in data["problema_especifico"].lower():
                  print(f"⚠️ Aviso: Posible sesgo en el problema del trabajo {i+1}")
             
             analizados.append(data)
+            reporte_titulos.append(f"   🔹 [{i+1}] {res.titulo[:60]}...")
             print(f"✅ FINALIZADO: {res.titulo[:50]}...")
         except Exception as e:
             print(f"❌ Error en trabajo {i+1}: {e}")
+    
+    lista_papers_analizados = "\n".join(reporte_titulos)
+    mensaje_salida = (
+        f"📋 Extracción y estructuración de la literatura completada.\n"
+        f"Se han generado fichas técnicas estandarizadas para los siguientes artículos:\n"
+        f"{lista_papers_analizados}\n" 
+    )
+
+    mensaje_salida2 = (
+        f"Aqui se muestra la lista técnica de los trabajos analizados:\n"
+        f"{analizados}"
+    )
+
+    mensaje_salida3 = f"Avanzando al diseño de la sección de categorías..."
             
-    return {"trabajos_analizados": analizados}
+    return {
+        "trabajos_analizados": analizados,
+        "messages": [
+            AIMessage(content=mensaje_salida),
+            AIMessage(content=mensaje_salida2)
+        ]
+    }
 
 def evaluar_categorizacion_node(state: AgentState) -> AgentState:
 
@@ -219,16 +431,19 @@ def evaluar_categorizacion_node(state: AgentState) -> AgentState:
 
     Evalúa si es recomendable categorizarlos.
 
-    Responde SOLO:
-
-    Recomendación: Sí o No
-    Justificación: breve explicación
+    Responde con Sí o No junto con una breve explicación del por qué. La explicación de máximo 1 párrafo de 50 palabras.
     """
 
     response = llm.invoke(prompt)
 
+    mensaje_salida = (
+        f"¿Te recomiendo añadir una división por categorías?\n"
+        f"{response.content}\n"
+        f"¿Cuál es tu decisión? (s/n)\n"
+    )
+
     return {
-        "messages": [AIMessage(content=response.content)]
+        "messages": [AIMessage(content=mensaje_salida)]
     }
     
 def decision_categorizacion_node(state: AgentState) -> AgentState:
@@ -241,8 +456,7 @@ def decision_categorizacion_node(state: AgentState) -> AgentState:
 
     try:
 
-        print("\n👤 ¿Deseas categorizar los trabajos relacionados?")
-        decision = input("Responder (s/n):\n> ").strip().lower()
+        decision = input().strip().lower()
 
         if decision not in ["s", "n"]:
             return {
@@ -252,26 +466,31 @@ def decision_categorizacion_node(state: AgentState) -> AgentState:
                 ]
             }
 
-        categorizar = decision == "s"
+        categorizar = (decision == "s")
+
+        texto_humano = "Sí, prefiero organizar la sección 'Related Works' dividida por categorías temáticas." if categorizar else "No, prefiero una redacción continua de los trabajos sin divisiones temáticas."
+        
+        texto_agente = (
+            "Decisión registrada con éxito. Iniciando la generación de propuestas de categorización..."
+            if categorizar else 
+            "Entendido. Omitiremos la creación de categorías y procederemos directamente con el diseño macro de la sección."
+        )
 
         return {
             "categorizar_activo": categorizar,
             "error": None,
             "messages": [
-                HumanMessage(
-                    content=f"El usuario ha decidido {'categorizar' if categorizar else 'no categorizar'} los trabajos relacionados."
-                ),
-                AIMessage(
-                    content=f"Decisión registrada. {'Se procederá a categorizar los trabajos.' if categorizar else 'Se continuará sin realizar categorización.'}"
-                )
+                HumanMessage(content=texto_humano),
+                AIMessage(content=texto_agente)
             ]
         }
 
     except Exception as e:
+        print(f"⚠️ Error en la entrada de datos: {e}")
         return {
             "error": f"Error en decisión de categorización: {str(e)}",
             "messages": [
-                AIMessage(content=f"Se produjo un error durante la toma de decisión sobre la categorización: {str(e)}")
+                AIMessage(content=f"🚨 Se interrumpió el flujo debido a un error inesperado en la entrada de datos: {str(e)}")
             ]
         }
 
@@ -282,7 +501,6 @@ def gateway_categorizacion(state: AgentState) -> str:
         return "redactar_introduccion"
 
 def proponer_categorias_node(state: AgentState) -> AgentState:
-    print("\n--- 🤖 PULIENDO PROPUESTA DE CATEGORÍAS ---")
     trabajos = state.get("trabajos_analizados", [])
     tema = state.get("tema_paper", "")
     mensajes_previos = state.get("messages", [])
@@ -295,17 +513,19 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
     
     TRABAJOS: {titulos_reales}
 
+    TEMA: {tema}
+
     ESTILO REQUERIDO:
-    1. NOMBRE CATEGORÍA: Máximo 4 palabras. Debe ser un concepto técnico (ej. 'Agentes Autónomos', 'Sistemas Multi-Agente', 'Arquitecturas LLM').
+    1. NOMBRE CATEGORÍA: Máximo 5 palabras. Debe ser un concepto técnico (ej. 'Agentes Autónomos', 'Sistemas Multi-Agente', 'Arquitecturas LLM').
     2. NO uses frases como "Investigación sobre..." o "El trabajo de...".
-    3. DESCRIPCIÓN: Una sola frase técnica y directa.
+    3. DESCRIPCIÓN: Una sola frase técnica y directa que describa la categoría.
     4. ENFOQUE: {'Busca una división por METODOLOGÍA' if es_reintento else 'Busca una división por TEMÁTICA'}.
     """
 
     try:
         # Forzamos una temperatura baja para evitar nombres creativos largos
         res = categorias_llm.invoke(prompt)
-        propuesta_dict = res.dict()
+        propuesta_dict = res.model_dump()
 
         asignados = set()
         categorias_finales = []
@@ -328,12 +548,46 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
         if faltantes and categorias_finales:
             categorias_finales[0]['trabajos'].extend(faltantes)
 
+        enfoque_str = "METODOLÓGICO" if es_reintento else "TEMÁTICO"
+        lineas_propuesta = [
+            f"He diseñado una propuesta de categorías bajo un enfoque **{enfoque_str}**.\n"
+            f"A continuación se muestran las categorías propuestas:\n"
+        ]
+
+        for idx, cat in enumerate(categorias_finales, 1):
+            lineas_propuesta.append(f"Categoría {idx}: **{cat['nombre']}**")
+            lineas_propuesta.append(f"   *Descripción:* {cat['descripcion']}")
+            lineas_propuesta.append("    *Artículos asociados:*")
+            for t in cat['trabajos']:
+                lineas_propuesta.append(f"      - {t[:75]}...")
+            lineas_propuesta.append("") # Línea en blanco de separación
+
+        mensaje_final = "\n".join(lineas_propuesta)
+
+        mensaje_final2 = (
+            f"¿Qué deseas hacer ahora?"
+            f"\n  [1] - Aceptar categorías y continuar."
+            f"\n  [2] - Pedir nuevas categorías."
+            f"\n  [3] - Modificar el nombre de alguna categoría."
+            f"\n  [4] - Rechazar categorías y redactar de corrido."
+            f"\nIntroduce el número de tu opción:"
+        )
+
         return {
             "categorias_propuestas": {"categorias": categorias_finales},
-            "messages": [AIMessage(content="Propuesta pulida y estilizada generada.")]
+            "error": None,
+            "messages": [
+                AIMessage(content=mensaje_final),
+                AIMessage(content=mensaje_final2)
+            ]
         }
+        
     except Exception as e:
-        return {"error": str(e)}
+        print(f"⚠️ Error en generación taxonómica: {e}")
+        return {
+            "error": f"Error al proponer categorías: {str(e)}",
+            "messages": [AIMessage(content=f"🚨 No se pudo consolidar la taxonomía automática: {str(e)}")]
+        }
 
 def confirmar_categorias_node(state: AgentState) -> AgentState:
     """
@@ -344,58 +598,52 @@ def confirmar_categorias_node(state: AgentState) -> AgentState:
     1. Aceptar las categorías propuestas.
     2. Rechazarlas y pedir nuevas categorías al agente.
     3. Modificar parcialmente las categorías propuestas.
+    4. Rechazar la inclusión de categorías.
     """
 
     try:
 
-        print("\n🤖 Categorías propuestas por el agente:\n")
-        print(state["categorias_propuestas"])
+        decision = input().strip()
 
-        print("\n👤 ¿Qué deseas hacer?")
-        print("1 - Aceptar categorías")
-        print("2 - Pedir nuevas categorías")
-        print("3 - Modificar alguna categoría")
-
-        decision = input("\nSelecciona una opción (1/2/3):\n> ").strip()
-
-        if decision not in ["1", "2", "3"]:
+        if decision not in ["1", "2", "3", "4"]:
             return {
                 "error": "Respuesta inválida.",
                 "messages": [
-                    AIMessage(content="La opción seleccionada no es válida. Debes elegir 1, 2 o 3.")
+                    AIMessage(content="La opción seleccionada no es válida. Debes elegir 1, 2 , 3 o 4.")
                 ]
             }
 
         if decision == "1":
-
             return {
                 "categorias_confirmadas": True,
                 "accion_categorias": "aceptar",
                 "error": None,
                 "messages": [
-                    HumanMessage(content="El usuario ha aceptado las categorías propuestas por el agente."),
-                    AIMessage(content="Categorías confirmadas. Se continuará con el análisis utilizando esta estructura.")
+                    HumanMessage(content="Opción 1: Apruebo la estructura de categorías propuesta."),
+                    AIMessage(content="Excelente. Estructura fijada. Procediendo a redactar la introducción de la sección Related Works...")
                 ]
             }
 
+        # OPCIÓN 2: Pedir nuevas categorías (Regenerar con otro enfoque)
         if decision == "2":
-
             return {
                 "categorias_confirmadas": False,
                 "accion_categorias": "regenerar",
                 "error": None,
                 "messages": [
-                    HumanMessage(content="El usuario ha rechazado las categorías propuestas y solicita generar nuevas categorías."),
-                    AIMessage(content="Entendido. Procederé a generar una nueva propuesta de categorización.")
+                    HumanMessage(content="Opción 2: No me convence esta agrupación, solicita generar nuevas categorías."),
+                    AIMessage(content="Entendido. Reorientando el análisis para ofrecerte una alternativa...")
                 ]
             }
 
+        # OPCIÓN 3: Modificar de forma personalizada
         if decision == "3":
-
-            print("\nDescribe qué categoría deseas modificar o qué cambio quieres realizar.")
-            print("Ejemplo: cambiar el nombre de la categoría 2 o mover el trabajo 3 a la categoría 1.\n")
-
-            instrucciones = input("✏️ Instrucciones de modificación:\n> ")
+            print("\n" + "-"*50)
+            print("INSTRUCCIONES DE MODIFICACIÓN")
+            print("Indica qué deseas cambiar (ej: 'Cambia el nombre de la categoría 1 a Modelos de Lenguaje' o 'Mueve el paper X a la categoría 2').")
+            print("-"*50)
+            
+            instrucciones = input().strip()
 
             return {
                 "categorias_confirmadas": False,
@@ -403,16 +651,30 @@ def confirmar_categorias_node(state: AgentState) -> AgentState:
                 "instrucciones_modificacion": instrucciones,
                 "error": None,
                 "messages": [
-                    HumanMessage(content=f"El usuario desea modificar la propuesta de categorías con las siguientes instrucciones: {instrucciones}"),
-                    AIMessage(content="He registrado las instrucciones de modificación. Procederé a ajustar la propuesta de categorías.")
+                    HumanMessage(content=f"Opción 3: Deseo ajustar las categorías con los siguientes cambios: '{instrucciones}'"),
+                    AIMessage(content="Modificaciones registradas. Ajustando el esquema de categorías según tus indicaciones...")
+                ]
+            }
+        
+        # OPCIÓN 4: Rechazar y avanzar en texto plano
+        if decision == "4":
+            return {
+                "categorizar_activo": False,
+                "categorias_confirmadas": False,
+                "accion_categorias": "rechazar",
+                "error": None,
+                "messages": [
+                    HumanMessage(content="Opción 4: Prefiero prescindir de las categorías y redactar la sección de corrido."),
+                    AIMessage(content="Entendido. Desactivando categorías. Preparando la estrategia para una redacción lineal unificada...")
                 ]
             }
 
     except Exception as e:
+        print(f"⚠️ Error en la toma de decisión: {e}")
         return {
             "error": f"Error confirmando categorías: {str(e)}",
             "messages": [
-                AIMessage(content=f"Se produjo un error durante la confirmación de categorías: {str(e)}")
+                AIMessage(content=f"Excepción en el nodo de confirmación: {str(e)}")
             ]
         }
     
@@ -428,6 +690,9 @@ def gateway_categorias(state: AgentState):
 
     if accion == "modificar":
         return "modificar_categorias"
+    
+    if accion == "rechazar":
+        return "redactar_introduccion"
 
     return "confirmar_categorias"
 
@@ -444,45 +709,38 @@ def modificar_categorias_node(state: AgentState) -> AgentState:
             return {
                 "error": "El JSON de categorías actuales no es válido.",
                 "messages": [
-                    AIMessage(content="⚠️ Error: las categorías actuales no son un JSON válido.")
+                    AIMessage(content="⚠️ Error operativo interno: El esquema de categorías previo no se pudo deserializar correctamente.")
                 ]
             }
 
     prompt = f"""
-Eres un asistente experto en organizar trabajos académicos. 
-SÓLO devuelves JSON válido con el mismo formato de entrada.
+    Eres un asistente experto en organizar trabajos académicos. 
+    SÓLO debes devolver un objeto JSON válido con el mismo formato de entrada.
 
-Categorías actuales:
-{json.dumps(categorias, indent=2, ensure_ascii=False)}
+    Categorías actuales:
+    {json.dumps(categorias, indent=2, ensure_ascii=False)}
 
-Instrucciones del usuario (pueden incluir):
-- Eliminar una categoría por nombre.
-- Mover trabajos de una categoría a otra.
-- Eliminar trabajos específicos de una categoría.
-- Renombrar categorías.
+    Instrucciones de modificación dadas por el usuario:
+    "{instrucciones}"
 
-TAREA:
-- Modifica las categorías según las instrucciones.
-- Mantén máximo 3 categorías.
-- Cada trabajo debe estar en una única categoría.
-- No inventes nuevos trabajos ni categorías.
-- Devuelve SOLO JSON, sin explicaciones.
+    TAREA EXCLUSIVA:
+    - Modifica la estructura actual aplicando con total precisión las instrucciones del usuario.
+    - Mantén un máximo de 3 categorías en el resultado final.
+    - Cada trabajo debe quedar asignado a una única categoría.
+    - No inventes nuevos títulos de trabajos ni añadas categorías no solicitadas.
+    - Devuelve ÚNICAMENTE el bloque JSON, sin introducciones, saludos ni bloques de código markdown.
 
-FORMATO DE RESPUESTA:
-{{
-  "categorias": [
+    FORMATO REQUERIDO:
     {{
-      "nombre": "Nombre categoría",
-      "descripcion": "Descripción breve",
-      "trabajos": ["Título trabajo 1", "Título trabajo 2"]
+      "categorias": [
+        {{
+          "nombre": "Nombre categoría",
+          "descripcion": "Descripción breve",
+          "trabajos": ["Título trabajo 1", "Título trabajo 2"]
+        }}
+      ]
     }}
-  ]
-}}
-"""
-
-    # Agregar las instrucciones del usuario al prompt
-    prompt += f"\nInstrucciones del usuario:\n{instrucciones}"
-
+    """
     response = llm.invoke(prompt)
 
     # Función para extraer JSON del texto del LLM
@@ -504,159 +762,361 @@ FORMATO DE RESPUESTA:
 
     if not nuevas or "categorias" not in nuevas:
         return {
-            "error": "El modelo no devolvió JSON válido.",
+            "error": "El modelo no devolvió un formato JSON procesable.",
             "messages": [
-                AIMessage(content="⚠️ Error al modificar categorías. El modelo no devolvió un JSON válido. Inténtalo de nuevo.")
+                AIMessage(content="⚠️ No logré interpretar las modificaciones aplicadas en un formato estructurado seguro. Por favor, intenta reformular los cambios.")
             ]
         }
 
+    lineas_resultado = [
+        "🛠️ **Modificaciones aplicadas con éxito.**",
+        "A continuación tienes el esquema taxonómico actualizado según tus peticiones:\n"
+    ]
+
+    for idx, cat in enumerate(nuevas.get('categorias', []), 1):
+        lineas_resultado.append(f"  📦 Nueva Categoría {idx}: **{cat.get('nombre')}**")
+        lineas_resultado.append(f"     💡 *Descripción:* {cat.get('descripcion')}")
+        lineas_resultado.append("     📄 *Artículos en esta sección:*")
+        for t in cat.get('trabajos', []):
+            lineas_resultado.append(f"        - {t[:75]}...")
+        lineas_resultado.append("")
+
+    mensaje_final = "\n".join(lineas_resultado)
+
+    mensaje_final2 = (
+            f"¿Qué deseas hacer ahora?"
+            f"\n  [1] - Aceptar categorías y continuar."
+            f"\n  [2] - Pedir nuevas categorías."
+            f"\n  [3] - Modificar el nombre de alguna categoría."
+            f"\n  [4] - Rechazar categorías y redactar de corrido."
+            f"\nIntroduce el número de tu opción:"
+        )
+
     return {
         "categorias_propuestas": nuevas,
+        "error": None,
         "messages": [
-            AIMessage(content="Categorías modificadas correctamente."),
-            AIMessage(content=json.dumps(nuevas, indent=2, ensure_ascii=False))
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_final2)
         ]
     }
 
 def redactar_introduccion_node(state: AgentState) -> AgentState:
-    print("\n--- ✍️ REDACTANDO INTRODUCCIÓN (FORMATO ESTRICTO 2 PÁRRAFOS) ---")
-    tema = state.get("tema_paper", "")
-    categorias = state.get("categorias_propuestas", {}).get("categorias", [])
     
-    nombres_cat = ", ".join([c['nombre'] for c in categorias])
-    detalles_cat = ". ".join([f"La categoría '{c['nombre']}' agrupa estudios sobre {c['descripcion'].lower()}" for c in categorias])
+    # 1. Recuperamos el nuevo modelo estructurado de tema_paper
+    contexto_paper = state.get("tema_paper", {})
+    
+    # Control de seguridad: Si por algún motivo viene como string, aplicamos fallbacks
+    if isinstance(contexto_paper, str):
+        dominio = contexto_paper
+        titulo_sistema = "El sistema propuesto"
+        aportacion = "abordar los problemas identificados en el sector"
+    else:
+        # Extraemos los campos correspondientes a la nueva estructura común de los papers
+        dominio = contexto_paper.get("problema_especifico", "este campo de estudio")
+        titulo_sistema = contexto_paper.get("titulo", "El sistema propuesto")
+        aportacion = contexto_paper.get("aportaciones_clave", "ofrecer una solución optimizada")
 
-    prompt = f"""
-    Eres un redactor académico de élite. Tu objetivo es escribir EXACTAMENTE dos párrafos de texto continuo.
+    # 2. Obtenemos las categorías de forma segura
+    categorias_propuestas = state.get("categorias_propuestas") or {}
+    categorias = categorias_propuestas.get("categorias", [])
+    hay_categorias = state.get("categorizar_activo")
 
-    REGLAS DE ORO:
-    1. PROHIBIDO usar listas, bullets (*), guiones o títulos internos.
-    2. PROHIBIDO citar nombres de papers o autores.
-    3. PÁRRAFO 1: Debe comenzar explicando que la sección Related Works explora el estado del arte y trabajos previos relevantes para contextualizar el desarrollo de agentes LLM en la redacción científica.
-    4. PÁRRAFO 2: Debe explicar que se ha optado por organizar la literatura en las categorías de {nombres_cat}. Justifica que esta división permite diferenciar entre enfoques (ej: individuales vs. colaborativos). {detalles_cat}.
-    5. No añadas nada más. Ni introducciones de "Aquí tienes", ni conclusiones.
+    # BIFURCACIÓN: Evaluamos si el flujo cuenta con categorías estructuradas o es secuencial
+    if hay_categorias and categorias:
+        # --- CASO A: SÍ HAY CATEGORÍAS ---
+        nombres_cat = ", ".join([c['nombre'] for c in categorias])
+        detalles_cat = ". ".join([f"La categoría '{c['nombre']}' agrupa estudios sobre {c['descripcion'].lower()}" for c in categorias])
 
-    CONTEXTO: {tema}
-    """
+        prompt = f"""
+        Tu única tarea es escribir una introducción académica muy breve para abrir la sección "Related Works".
+        Debes generar EXACTAMENTE DOS PÁRRAFOS cortos. Está TERMINANTEMENTE PROHIBIDO generar más bloques o párrafos de texto.
+
+        REGLAS DE FORMATO CRÍTICAS:
+        - NO uses listas, bullets (*), guiones, subtítulos ni enumeraciones.
+        - NO cites autores ni nombres de papers externos.
+        - NO hables de tus retos técnicos ni metodologías internas. Sé directo.
+
+        INSTRUCCIONES POR PÁRRAFO:
+        - PÁRRAFO 1: Debe constar únicamente de dos frases continuas en el mismo bloque:
+          1. Frase 1 (Empieza exactamente así): "Esta sección revisa y describe los trabajos relacionados con {dominio}."
+          2. Frase 2 (Conecta inmediatamente con tu sistema): "En este contexto, '{titulo_sistema}' tiene como objetivo contribuir mediante {aportacion}."
+        - PÁRRAFO 2: Debe explicar textualmente que la literatura previa se ha organizado en las siguientes categorías: {nombres_cat}. Añade esta descripción corrida y fluida: {detalles_cat}.
+        """
+    else:
+        # --- CASO B: NO HAY CATEGORÍAS (Estructura Secuencial/Plana) ---
+        prompt = f"""
+        Tu única tarea es escribir una introducción académica muy breve para abrir la sección "Related Works".
+        Debes generar EXACTAMENTE DOS PÁRRAFOS cortos. Está TERMINANTEMENTE PROHIBIDO generar más bloques o párrafos de texto.
+
+        REGLAS DE FORMATO CRÍTICAS:
+        - NO uses listas, bullets (*), guiones, subtítulos ni enumeraciones.
+        - NO cites autores ni nombres de papers externos.
+        - NO hables de tus retos técnicos ni metodologías internas. Sé directo.
+
+        INSTRUCCIONES POR PÁRRAFO:
+        - PÁRRAFO 1: Debe constar únicamente de dos frases continuas en el mismo bloque:
+          1. Frase 1 (Empieza exactamente así): "Esta sección revisa y describe los trabajos relacionados con {dominio}."
+          2. Frase 2 (Conecta inmediatamente con tu sistema): "En este contexto, '{titulo_sistema}' tiene como objetivo contribuir mediante {aportacion}."
+        """
 
     try:
         response = llm.invoke(prompt)
         
         texto_sucio = response.content.strip()
-        
         lineas = texto_sucio.split('\n')
 
+        # Filtro estricto de limpieza: elimina líneas vacías accidentales y cualquier residuo Markdown
         lineas_limpias = [
-            l for l in lineas 
+            l.strip() for l in lineas 
             if l.strip() and not l.strip().startswith(('*', '-', '1.', '#'))
         ]
         
+        # Unimos asegurando la separación en dos párrafos limpios
         texto_final = "\n\n".join(lineas_limpias)
+
+        tipo_estrategia = "estructurada por subsecciones" if hay_categorias else "lineal continua"
+        mensaje_salida = (
+            f"Borrador de la Introducción generado con éxito(Estrategia: {tipo_estrategia}).\n"
+            f"A continuación se presenta el texto académico redactado:\n\n"
+            f'"{texto_final}"\n\n'
+        )
+
+        mensaje_final2 = f"Avanzando a la redacción de los trabajos relacionados..."
 
         return {
             "introduccion_related_works": texto_final,
-            "messages": [AIMessage(content="Introducción de 2 párrafos generada.")]
+            "error": None,
+            "messages": [
+                AIMessage(content=mensaje_salida),
+                AIMessage(content=mensaje_final2),
+            ]
         }
+        
     except Exception as e:
-        return {"error": str(e)}
+        print(f"⚠️ Error redactando introducción: {e}")
+        return {
+            "error": f"Error en redacción de introducción: {str(e)}",
+            "messages": [AIMessage(content=f"🚨 No se pudo redactar el bloque de introducción: {str(e)}")]
+        }
 
 def redactar_trabajos_relacionados_node(state: AgentState) -> AgentState:
-    print("\n--- ✍️ REDACTANDO CUERPO (SOLO CATEGORÍAS Y PAPERS) ---")
-    trabajos = state.get("trabajos_analizados", [])
-    categorias_json = state.get("categorias_propuestas", {}).get("categorias", [])
-
-    if not categorias_json:
-        return {"error": "No hay categorías para redactar."}
-
-    trabajos_map = {t["titulo"]: t for t in trabajos}
-
-    prompt = f"""
-    Actúa como un transcriptor de bases de datos académicas. Tu única función es formatear información.
-
-    INSTRUCCIONES DE FORMATO (ESTRICTAS):
-    1. Escribe el NOMBRE DE LA CATEGORÍA como un título.
-    2. Debajo de cada categoría, redacta UN PÁRRAFO por cada paper asignado a ella.
-    3. CADA PÁRRAFO debe empezar exactamente así: "El trabajo '[TÍTULO DEL PAPER]' ([AÑO]) ..."
-    4. El párrafo debe integrar: Problema, Metodología, Aportaciones y Limitaciones en un solo bloque de texto fluido.
     
-    PROHIBICIONES:
-    - NO escribas introducciones generales a la sección.
-    - NO escribas introducciones a las categorías.
-    - NO uses listas de puntos (bullets).
-    - NO uses frases como "En el campo de..." o "Otro trabajo destacado es...".
-    - NO repitas información fuera del párrafo del paper.
+    trabajos = state.get("trabajos_analizados", [])
+    categorias = state.get("categorias_propuestas", {})
 
-    DATOS A PROCESAR (Agrupados por categoría):
-    {json.dumps(categorias_json, indent=2, ensure_ascii=False)}
+    hay_categorias = state.get("categorizar_activo")
 
-    DATOS TÉCNICOS DE LOS PAPERS:
-    {json.dumps(trabajos, indent=2, ensure_ascii=False)}
+    # BIFURCACIÓN: Evaluamos si el flujo cuenta con categorías estructuradas o es secuencial
+    if categorias and hay_categorias:
+        # --- CASO A: SÍ HAY CATEGORÍAS ---
+        
+        prompt = f"""
+        Actúa como un transcriptor de bases de datos académicas. Tu única función es formatear información.
 
-    IDIOMA: Español académico.
-    """
+        INSTRUCCIONES DE FORMATO (ESTRICTAS):
+        1. Escribe el NOMBRE DE LA CATEGORÍA como un título independiente.
+        2. Debajo de cada categoría, redacta EXACTAMENTE UN PÁRRAFO continuo por cada paper asignado a ella.
+        3. CADA PÁRRAFO debe empezar exactamente así: "El trabajo '[TÍTULO DEL PAPER]' ([AÑO]) ..."
+        4. El párrafo debe integrar obligatoriamente: Problema, Metodología, Aportaciones y Limitaciones en un solo bloque de texto fluido.
+        
+        PROHIBICIONES:
+        - NO escribas introducciones generales a la sección.
+        - NO escribas introducciones ni explicaciones a las categorías.
+        - NO uses listas de puntos (bullets), guiones o enumeraciones.
+        - NO uses frases como "En el campo de..." o "Otro trabajo destacado es...".
+        - NO repitas información fuera del párrafo del paper.
+        - No escribas nada más que los títulos de las categorías y los párrafos de los trabajos redactados.
+
+        DATOS A PROCESAR (Agrupados por categoría):
+        {json.dumps(categorias, indent=2, ensure_ascii=False)}
+
+        DATOS TÉCNICOS DE LOS PAPERS:
+        {json.dumps(trabajos, indent=2, ensure_ascii=False)}
+
+        IDIOMA: Español académico.
+        """
+    else:
+        # --- CASO B: NO HAY CATEGORÍAS (Redacción Secuencial Plana) ---
+        # Eliminamos las comprobaciones analíticas de conteo que congelan el modelo
+
+        prompt = f"""
+        Eres un investigador redactando la sección "Related Works" de un paper científico. 
+        Se te dan los siguientes trabajos relacionados para que redactes un párrafo por cada uno de ellos.
+
+        TRABAJOS ANALIZADOS:
+        {json.dumps(trabajos, indent=2, ensure_ascii=False)}
+        
+        TAREA:
+        - Deberás redactar el cuerpo de la sección "Related Works" escribiendo un párrafo por cada uno de los papers que se te han adjuntado.
+
+        INSTRUCCIONES:
+        - Cada paper debe describirse en un párrafo
+        - Cada parrafo debe comenzar asi: "El trabajo..."
+        - Se debe especificar el TITULO y AÑO
+        - Mantener estilo académico formal
+
+        SE DEBE INCLUIR EN CADA PAPER:
+        - objetivo
+        - metodología
+        - contribuciones
+        - ventajas
+        - limitaciones
+
+        REGLAS:
+        - No incluir introducciones, conlusiones, resuemnes ni comentarios. Solo los parrafos de los papers.
+        - No usar categorías
+        - No listas
+        - Texto continuo
+        - Que no haya ninguna texto más a parte de los parrafos de los papers
+
+        IDIOMA:
+        Español académico
+
+        Devuelve SOLO el texto.
+        """
 
     try:
+        # Invocación directa
         response = llm.invoke(prompt)
         
+        # Limpieza estándar de artefactos de formato markdown que suele arrojar el LLM
         texto_redactado = response.content.replace("###", "").replace("**", "").strip()
 
+        # Ajustamos el mensaje de log según el flujo ejecutado
+        tipo_redaccion = "con estructura de categorías" if (categorias and hay_categorias) else "en formato secuencial lineal"
+
+        previsualizacion = "\n".join(texto_redactado.split("\n")[:8])
+        
+        mensaje_salida = (
+            f"Cuerpo del Estado del Arte redactado de forma autónoma.\n"
+            f"El documento se ha generado utilizando un enfoque *{tipo_redaccion}*.\n\n"
+            f"Previsualización del manuscrito:\n"
+            f"{previsualizacion}\n"
+            f"   [... El texto continúa analizando de manera fluida el resto de las obras ...]\n\n"
+        )
+
+        mensaje_final = f"Avanzando hacia la redacción de la tabla comparativa..."
+        
         return {
             "related_works_section": texto_redactado,
-            "messages": [AIMessage(content="Cuerpo de Related Works generado sin introducciones.")]
+            "error": None,
+            "messages": [
+                AIMessage(content=mensaje_salida),
+                AIMessage(content=mensaje_final)
+            ]
         }
     except Exception as e:
-        return {"error": f"Error en redacción: {e}"}
+        print(f"⚠️ Error en la redacción del estado del arte: {e}")
+        return {
+            "error": f"Error en la redacción del cuerpo: {e}",
+            "messages": [AIMessage(content=f"🚨 No se pudo redactar la revisión de literatura: {str(e)}")]
+        }
 
 def recomendar_tabla_node(state: AgentState):
 
     prompt = f"""
-    Eres un agente que esta redactando la sección "Related Works" de un paper de investigación.
-    Con los datos que se te encomiendan a continuación, debes realizar un recomendación sobre si
-    incluir o no una tabla comparativa a modo de resumen visual para comparar el paper de investigación
-    con los trabajos relacionados que se exploran en esta sección que se esta redactando.
+    Eres un agente experto y revisor de revistas científicas indexadas. 
+    A partir de los datos provistos, debes realizar una recomendación formal sobre si es metodológicamente 
+    necesario o enriquecedor incluir una tabla comparativa (matriz de características) al final de la sección 
+    "Related Works" para contrastar la propuesta del autor con la literatura analizada.
 
-Tema:
-{state["tema_paper"]}
+    Ficha técnica de nuestro Paper:
+    {state["tema_paper"]}
 
-Trabajos:
-{json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
+    Trabajos Relacionados Analizados:
+    {json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
 
-Categorías:
-{json.dumps(state.get("categorias_propuestas", {}), indent=2, ensure_ascii=False)}
+    Categorías Taxonómicas:
+    {json.dumps(state.get("categorias_propuestas", {}), indent=2, ensure_ascii=False)}
 
-¿Recomiendas tabla comparativa?
-
-Formato:
-Recomendación: SI/NO
-Justificación: ...
-
-REGLAS:
-- La justificación debe ser breve y debe inlcuir razones de peso sobre la inclusión o no de la tabla.
-"""
+    FORMATO REQUERIDO OBLIGATORIO:
+    Recomendación: [Escribe SÍ o NO]
+    Justificación: [Escribe una justificación científica, breve y con razones de peso]
+    """
 
     res = llm.invoke(prompt)
 
+    contenido_recomendacion = res.content.strip()
+
+    # --- PARSING ESTRATÉGICO PARA DISEÑO VISUAL ---
+    # Detectamos si el LLM recomienda un SÍ o un NO de manera robusta
+    es_si = "recomendación: sí" in contenido_recomendacion.lower() or "recomendación: si" in contenido_recomendacion.lower()
+    
+    # Limpiamos las etiquetas repetitivas del texto para formatearlo nosotros de forma más bella
+    justificacion_limpia = contenido_recomendacion
+    if "justificación:" in contenido_recomendacion.lower():
+        justificacion_limpia = contenido_recomendacion.lower().split("justificación:")[1].strip()
+    elif "justificacion:" in contenido_recomendacion.lower():
+         justificacion_limpia = contenido_recomendacion.lower().split("justificacion:")[1].strip()
+
+    # --- REPORTE CONVERSACIONAL DE ALTA CALIDAD ---
+    lineas_mensaje = []
+    if es_si:
+        lineas_mensaje.append("Recomendación de estructura: Se recomienda la inclusión de una Tabla Comparativa.")
+    else:
+        lineas_mensaje.append("Recomendación de estructura: No se considera crítica una Tabla Comparativa.")
+        
+    lineas_mensaje.append(f"\nJustificación: {justificacion_limpia.capitalize()}")
+
+    mensaje_final = "\n".join(lineas_mensaje)
+
+    mensaje_final2 = f"¿Deseas incluir la tabla comparativa? (s/n):"
+
     return {
-        "recomendacion_tabla": res.content,
+        "recomendacion_tabla": contenido_recomendacion,
+        "error": None,
         "messages": [
-            AIMessage(content="Evaluando necesidad de tabla..."),
-            AIMessage(content=res.content)
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_final2)
         ]
     }
 
 def decision_tabla_node(state: AgentState):
 
-    #print("\n🤖 Recomendación:\n")
-    #print(state["recomendacion_tabla"])
+    try:
+        # Lanzamos el input de forma clara guiando al usuario
+        dec = input().strip().lower()
 
-    dec = input("\n👤 ¿Añadir tabla? (s/n): ").lower()
+        # Validación básica por si el usuario introduce una opción incorrecta
+        if dec not in ["s", "n"]:
+            mensaje_error = "⚠️ Opción no válida. Por favor, introduce 's' para generar la tabla o 'n' para omitirla."
+            return {
+                "error": "Respuesta inválida en tabla.",
+                "messages": [
+                    HumanMessage(content=f"Intento de decisión sobre tabla: '{dec}'"),
+                    AIMessage(content=mensaje_error)
+                ]
+            }
 
-    return {
-        "tabla_comparativa_activa": dec == "s",
-        "messages": [
-            HumanMessage(content=f"Usuario decide tabla: {dec}")
-        ]
-    }
+        activa = (dec == "s")
+
+        # Mensajes con enfoque conversacional en primera persona
+        texto_humano = "Sí, por favor, genera una tabla comparativa para resumir visualmente los trabajos." if activa else "No, prefiero avanzar sin incluir una tabla comparativa en esta sección."
+        
+        texto_agente = (
+            "Elección registrada. Procediendo a analizar los papers para proponer las columnas y criterios de comparación..."
+            if activa else 
+            "Entendido. Saltaremos la fase construcción de una tabla comparativa y avanzaremos directamente hacia las conclusiones de la sección."
+        )
+
+        return {
+            "tabla_comparativa_activa": activa,
+            "error": None,
+            "messages": [
+                HumanMessage(content=texto_humano),
+                AIMessage(content=texto_agente)
+            ]
+        }
+
+    except Exception as e:
+        print(f"⚠️ Error en la decisión de la tabla: {e}")
+        return {
+            "error": f"Error en decisión de tabla: {str(e)}",
+            "messages": [
+                AIMessage(content=f"🚨 Ocurrió un inconveniente al registrar tu decisión sobre la tabla: {str(e)}")
+            ]
+        }
 
 def gateway_tabla(state: AgentState):
     return "proponer_estructura" if state["tabla_comparativa_activa"] else "redactar_conclusion"
@@ -707,6 +1167,7 @@ FORMATO:
 REGLAS:
 
 - SOLO JSON
+- Trata de no incluir muchos campos del JSON de trabajos_analizados como columnas (salvo el campo título)
 - 5-8 columnas
 - incluir "Título"
 - columnas deben ser diferentes a las anteriores
@@ -725,72 +1186,92 @@ Si no puedes → null
         if not nueva:
             continue
 
-        if not estructura_anterior:
+        if not estructura_anterior or not estructuras_similares(estructura_anterior, nueva):
+            
+            # --- CONSTRUCCIÓN DEL MENSAJE CONVERSACIONAL Y MENÚ ---
+            columnas_formateadas = ", ".join([f"[{c}]" for c in nueva.get("columnas", [])])
+            
+            lineas_mensaje = [
+                "Propuesta de Estructura para la Tabla Comparativa\n",
+                f" Columnas sugeridas: {columnas_formateadas}",
+                f" Justificación metodológica: {nueva.get('justificacion')}\n",
+                " ¿Qué deseas hacer con este diseño de tabla?",
+                "  [1] - Aceptar estructura y rellenar los datos automáticamente.",
+                "  [2] - Pedir una nueva estructura (forzará un enfoque analítico alternativo).",
+                "  [3] - Modificar o añadir columnas de forma personalizada.",
+                "  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
+            ]
+            
             return {
                 "estructura_tabla_propuesta": nueva,
-                "messages": [AIMessage(content=json.dumps(nueva, indent=2, ensure_ascii=False))]
-            }
-
-        # 🔥 VALIDAR DIFERENCIA REAL
-        if not estructuras_similares(estructura_anterior, nueva):
-            return {
-                "estructura_tabla_propuesta": nueva,
-                "messages": [
-                    AIMessage(content="Nueva estructura generada correctamente"),
-                    AIMessage(content=json.dumps(nueva, indent=2, ensure_ascii=False))
-                ]
+                "error": None,
+                "messages": [AIMessage(content="\n".join(lineas_mensaje))]
             }
 
     # 🚨 FALLBACK SI FALLA TODO
+    mensaje_fallback = (
+        "⚠️ No logré generar automáticamente una estructura suficientemente diferente a la anterior.\n"
+        "👉 Te sugiero seleccionar la opción de modificación personalizada en el siguiente paso para adaptarla a tus necesidades."
+    )
     return {
-        "messages": [
-            AIMessage(content="⚠️ No se pudo generar una estructura suficientemente diferente. Intenta modificar manualmente.")
-        ]
+        "error": "Exceso de similitud en reintentos.",
+        "messages": [AIMessage(content=mensaje_fallback)]
     }
 
 def confirmar_estructura_node(state: AgentState):
 
-    print("\n📊 Estructura actual:\n")
-    print(json.dumps(state["estructura_tabla_propuesta"], indent=2, ensure_ascii=False))
-
-    print("\nOpciones:")
-    print("1 → Aceptar estructura")
-    print("2 → Generar nueva propuesta")
-    print("3 → Modificar estructura")
-
-    opcion = input("\n👤 Elige opción (1/2/3): ").strip()
+    opcion = input().strip()
 
     if opcion == "1":
         return {
             "estructura_tabla_confirmada": True,
             "accion_estructura": "aceptar",
-            "messages": [HumanMessage(content="Aceptar estructura")]
+            "error": None,
+            "messages": [
+                HumanMessage(content="Acepto la estructura propuesta para la tabla."),
+                AIMessage(content="Estructura aprobada. Procediendo a generar la tabla con datos de los papers analizados...")
+            ]
         }
 
     elif opcion == "2":
         return {
             "estructura_tabla_confirmada": False,
             "accion_estructura": "nueva",
-            "messages": [HumanMessage(content="Generar nueva estructura")]
+            "error": None,
+            "messages": [
+                HumanMessage(content="Prefiero generar una propuesta de estructura nueva."),
+                    AIMessage(content="🔄 Entendido. Solicitando al analista un nuevo enfoque comparativo alternativo...")
+            ]
         }
 
     elif opcion == "3":
-        instrucciones = input(
-            "\n✏️ Indica cómo modificar la estructura:\n> "
-        )
-
+        instrucciones = input("\nIndica los cambios (ej. 'Quita la columna X y añade una columna para el Dataset utilizado'):\n> ").strip()
+            
         return {
             "estructura_tabla_confirmada": False,
             "accion_estructura": "modificar",
             "instrucciones_tabla": instrucciones,
+            "error": None,
             "messages": [
-                HumanMessage(content=f"Modificar: {instrucciones}")
+                HumanMessage(content=f"Deseo modificar la estructura: {instrucciones}"),
+                AIMessage(content="Rediseñando el esquema de la tabla incorporando tus instrucciones de personalización...")
+            ]
+        }
+        
+    elif opcion == "4":
+        return {
+            "tabla_comparativa_activa": False,
+            "estructura_tabla_confirmada": False,
+            "accion_estructura": "rechazar",
+            "error": None,
+            "messages": [
+                HumanMessage(content="Rechazo la inclusión de la tabla comparativa."),
+                AIMessage(content="Diseño de tabla cancelado. Guardando avances y redirigiendo el flujo hacia la redacción de las conclusiones de la sección...")
             ]
         }
 
     else:
-        print("Opción inválida.")
-        return confirmar_estructura_node(state)
+        print("⚠️ Opción inválida. Por favor, introduce un número del 1 al 4.")
 
 def modificar_estructura_node(state: AgentState):
 
@@ -834,18 +1315,37 @@ Si no puedes generar JSON válido → devuelve null
     res = llm.invoke(prompt)
     nueva = extraer_json(res.content)
 
-    if not nueva:
+    if not nueva or "columnas" not in nueva:
         return {
+            "error": "El modelo no generó un JSON de estructura válido.",
             "messages": [
-                AIMessage(content="⚠️ Error modificando estructura. Intenta de nuevo.")
+                AIMessage(content="⚠️ No logré interpretar los cambios solicitados en un esquema de columnas válido. Por favor, intenta reformular tus instrucciones de modificación.")
             ]
         }
 
+    # --- REPORTE VISUAL UNIFICADO EN UN ÚNICO MENSAJE ---
+    columnas_actualizadas = ", ".join([f"[{c}]" for c in nueva.get("columnas", [])])
+    
+    lineas_mensaje = [
+        " Esquema de la tabla modificado y personalizado correctamente.",
+        f" Columnas finales de la matriz: {columnas_actualizadas}",
+        f" Nueva justificación de diseño: {nueva.get('justificacion')}\n",
+    ]
+
+    mensaje_final = (
+        f" ¿Qué deseas hacer con este diseño de tabla?",
+            f"  [1] - Aceptar estructura y rellenar los datos automáticamente.",
+            f"  [2] - Pedir una nueva estructura (forzará un enfoque analítico alternativo).",
+            f"  [3] - Modificar o añadir columnas de forma personalizada.",
+            f"  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
+    )
+
     return {
         "estructura_tabla_propuesta": nueva,
+        "error": None,
         "messages": [
-            AIMessage(content="Estructura modificada correctamente"),
-            AIMessage(content=json.dumps(nueva, indent=2, ensure_ascii=False))
+            AIMessage(content="\n".join(lineas_mensaje)),
+            AIMessage(content=mensaje_final),
         ]
     }
 
@@ -861,6 +1361,9 @@ def gateway_estructura(state: AgentState):
 
     elif accion == "modificar":
         return "modificar_estructura"
+    
+    elif accion == "rechazar":
+        return "redactar_conclusion"
 
     return "proponer_estructura"
 
@@ -871,8 +1374,8 @@ Eres un investigador redactando una tabla comparativa para un paper científico.
 
 CONTEXTO:
 
-Tema del paper:
-{state["tema_paper"]}
+Trabajo Propio:
+{json.dumps(state["tema_paper"], indent=2, ensure_ascii=False)}
 
 Trabajos analizados:
 {json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
@@ -882,13 +1385,12 @@ Estructura de la tabla:
 
 TAREA:
 
-Generar una tabla comparativa en formato Markdown.
+Generar una tabla comparativa en formato Markdown con todos los papers realcionados y el trabajo propio.
 
 FORMATO:
 
 - Cada FILA = un paper
 - Columnas según la estructura definida
-- Incluir una fila final: **Trabajo propio**
 
 REGLAS CRÍTICAS (OBLIGATORIAS):
 
@@ -925,11 +1427,22 @@ Si no puedes cumplir TODAS las reglas, la respuesta es inválida.
 
     res = llm.invoke(prompt)
 
+    tabla_markdown = res.content.strip()
+
+    # --- REPORTE CONVERSACIONAL UNIFICADO ---
+    mensaje_final = (
+        "Tabla Comparativa Generada.\n"
+        f"{tabla_markdown}\n\n"
+    )
+
+    mensaje_final2 = f"Avanzando a la descripción de la tabla..."
+
     return {
-        "tabla_comparativa_generada": res.content.strip(),
+        "tabla_comparativa_generada": tabla_markdown,
+        "error": None,
         "messages": [
-            AIMessage(content="Tabla comparativa generada."),
-            AIMessage(content=res.content)
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_final2)
         ]
     }
 
@@ -990,15 +1503,23 @@ Solo el texto (sin encabezados tipo "Descripción de la tabla")
 """
 
     res = llm.invoke(prompt)
+    texto_descripcion = res.content.strip()
 
-    print("\nDEBUG DESCRIPCIÓN:", repr(res.content))
+    # --- REPORTE CONVERSACIONAL UNIFICADO ---
+    mensaje_final = (
+        " Descripción de la tabla comparativa generada.\n"
+        "Este texto servirá de apoyo formal en el manuscrito para introducir los criterios analizados:\n\n"
+        f'"{texto_descripcion}"\n\n'
+    )
+
+    mensaje_final2 = f"Avanzando a la redacción de las conclusiones de la sección..."
 
     return {
-        "descripcion_tabla": res.content.strip(),
+        "descripcion_tabla": texto_descripcion,
+        "error": None,
         "messages": [
-            AIMessage(content="Descripción de la tabla generada."),
-            AIMessage(content=res.content)
-        ]
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_final2)]
     }
 
 def redactar_conclusion_node(state: AgentState):
@@ -1075,19 +1596,168 @@ Solo el párrafo.
 """
 
     res = llm.invoke(prompt)
+    parrafo_conclusion = res.content.strip()
+
+    # --- REPORTE CONVERSACIONAL DE CIERRE DE GENERACIÓN ---
+    mensaje_final = (
+        " Párrafo de Conclusión generado.\n"
+        f'"{parrafo_conclusion}"\n\n'
+    )
+
+    mensaje_final2 = f"Avanzando a la última fase para revisar, homogeneizar e incluir referencias bibliográficas..."
 
     return {
-        "conclusion_related_work": res.content.strip(),
+        "conclusion_related_work": parrafo_conclusion,
+        "error": None,
         "messages": [
-            AIMessage(content="Conclusión generada."),
-            AIMessage(content=res.content)
+            AIMessage(content=mensaje_final),
+            AIMessage(content=mensaje_final2)
         ]
     }
+
+def revision_final_node(state: AgentState):
+    
+    # Datos de control y contexto
+    idioma = state.get("idioma_salida","")
+    paper_propio = state.get("tema_paper", [])
+    trabajos = state.get("trabajos_analizados", [])
+    categorias = state.get("categorias_propuestas", "")
+    estructura_tabla = state.get("estructura_tabla_propuesta", "")
+
+    # Textos reales que deben ser fusionados
+    introduccion = state.get("introduccion_related_works", "")
+    cuerpo = state.get("related_works_section", "")
+    descripcion = state.get("descripcion_tabla", "")
+    tabla = state.get("tabla_comparativa_generada", "")
+    conclusion = state.get("conclusion_related_work", "")
+
+    # 1. CONSTRUIMOS EL ENTORNO DE BIBLIOGRAFÍA EN LATEX (thebibliography)
+    guias_cita_latex = []
+    items_bibliografia = []
+    
+    for idx, t in enumerate(trabajos, 1):
+        titulo = t.get("titulo", "Sin título")
+        anio = t.get("anio") or t.get("year") or "s.f."
+        autores = t.get("autores") or t.get("authors") or "Et al."
+        
+        if isinstance(autores, list) and len(autores) > 0:
+            autores_str = ", ".join(autores)
+        else:
+            autores_str = str(autores)
+            
+        # Creamos la guía para que el LLM estampe la clave de citación exacta de LaTeX
+        guias_cita_latex.append(f"- Para el paper '{titulo}': Insertar el comando de cita '\\cite{{ref-{idx}}}'")
+        
+        # Estructuramos el bibitem para el entorno final
+        items_bibliografia.append(f"\\bibitem{{ref-{idx}}} {autores_str}. ``{titulo},'' {anio}.")
+
+    guia_citas_str = "\n".join(guias_cita_latex)
+    
+    # Bloque final de bibliografía estructurado para LaTeX
+    bloque_bibliografia_latex = (
+        "\\begin{thebibliography}{" + str(len(trabajos)) + "}\n" +
+        "\n".join(items_bibliografia) +
+        "\n\\end{thebibliography}"
+    )
+
+    prompt = f"""
+    Actúas como un transcriptor experto en tipografía científica y LaTeX. Tu única misión es fusionar los textos provistos en el apartado "TEXTOS A FUSIONAR" y devolver la sección "Related Works" estructurada EXCLUSIVAMENTE en código LaTeX profesional.
+
+    INSTRUCCIONES DE FORMATO LATEX (CRÍTICAS):
+    1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{{Related Works}}` al inicio. Para los subtítulos (si hay categorías), utiliza `\\subsection{{Nombre de la Categoría}}`.
+    2. CITAS EN EL TEXTO: En el cuerpo de los trabajos relacionados, busca dónde se menciona cada paper. Justo después de escribir el título de un trabajo, debes insertar su comando de cita correspondiente. Sigue estrictamente esta guía de mapeo:
+    {guia_citas_str}
+    3. CITAS EN LA TABLA: En la celda del título de cada paper dentro de la tabla de LaTeX, debes incluir también su respectivo comando `\\cite{{ref-x}}`.
+    4. TRADUCCIÓN DE LA TABLA A LATEX: Transforma la tabla comparativa actual (que viene en Markdown) a un entorno profesional de LaTeX utilizando `\\begin{{table}}[h]`, `\\centering`, y el entorno `\\begin{{tabular}}`. Utiliza `\\hline` para separar las cabeceras y las filas adecuadamente. Asegúrate de escapar caracteres conflictivos de LaTeX si aparecen en el texto (como % o _).
+    5. TEXTO CONTINUO: Asegúrate de que los párrafos se unifiquen sin costuras ortográficas o mayúsculas erróneas producto de la concatenación. Usa salto de línea doble en LaTeX para separar párrafos.
+
+    ORDEN DEL DOCUMENTO LATEX (ESTRICTO):
+    1. `\\section{{Related Works}}`
+    2. Texto de la INTRODUCCIÓN.
+    3. CUERPO DE TRABAJOS RELACIONADOS (Con sus subsecciones si hay categorías y comandos `\\cite{{}}` insertados).
+    4. DESCRIPCIÓN DE LA TABLA COMPARATIVA.
+    5. Entorno completo de la TABLA (`\\begin{{table}}` ... `\\end{{table}}`).
+    6. CONCLUSIÓN DE LA SECCIÓN.
+    7. Entorno de BIBLIOGRAFÍA (Copia exactamente el bloque de bibliografía en LaTeX provisto abajo).
+
+    PROHIBICIONES ABSOLUTAS:
+    - NO utilices sintaxis Markdown (*, #, **, etc.) en ninguna parte del output. Todo debe ser LaTeX.
+    - NO añadas preámbulos de documento completo (`\\documentclass`, `\\begin{{document}}`, etc.). Solo el fragmento del capítulo.
+    - NO agregues textos de saludo, explicaciones o comentarios finales sobre el idioma. El output debe empezar directamente con el comando `\\section`.
+
+    TEXTOS A FUSIONAR:
+    - INTRODUCCIÓN: {introduccion}
+    - CUERPO DE TRABAJOS: {cuerpo}
+    - DESCRIPCIÓN DE TABLA: {descripcion}
+    - TABLA COMPARATIVA (MARKDOWN ACTUAL): {tabla}
+    - CONCLUSIÓN: {conclusion}
+
+    BLOQUE DE BIBLIOGRAFÍA EN LATEX A PEGAR AL FINAL:
+    {bloque_bibliografia_latex}
+
+    IDIOMA: {idioma} pulido de alto nivel.
+    """
+
+    try:
+        response = llm.invoke(prompt)
+        texto_final_latex = response.content.strip()
+        
+        # Aseguramos el bloque de cierre por si el LLM sufriera algún truncamiento menor
+        if "\\begin{thebibliography}" not in texto_final_latex:
+            texto_final_latex += "\n\n" + bloque_bibliografia_latex
+        
+        lineas_vista = texto_final_latex.split("\n")
+        previsualizacion = "\n".join(lineas_vista[:6])
+        lineas_totales = len(lineas_vista)
+
+        mensaje_final = (
+            "Texto revisado correctamente y generado en formato Latex \n"
+            "El agente ha homogeneizado e integrado todas las referencias, tablas dimensionales y citas cruzadas de forma nativa.\n\n"
+            f"Métricas de salida: {lineas_totales} líneas de código científico consolidado.\n\n"
+            f"Inicio del fragmento generado:\n"
+            f"```latex\n"
+            f"{previsualizacion}\n"
+            f"...\n"
+            f"\\end{{thebibliography}}\n"
+            f"```\n"
+            "El documento completo e indexado ha sido guardado de forma segura en la clave `related_works_document` del estado de tu agente LangGraph listo para su exportación final."
+        )
+
+        mensaje_final2 = (
+            f"Procediendo a guardar el estado del agente y guardar el texto final en un documento con extensión .tex..."
+        )
+
+        mensaje_final3 = f"Trabajo generado correctamente. Aqui termina mi trabajo. ¡Espero haberte ayudado!"
+
+        return {
+            "related_works_document": texto_final_latex,
+            "error": None,
+            "messages": [
+                AIMessage(content=mensaje_final),
+                AIMessage(content=mensaje_final2),
+                AIMessage(content=mensaje_final3)
+            ]
+        }
+
+    except Exception as e:
+        print(f"⚠️ Error crítico en el ensamblado final: {e}")
+        fallback_latex = f"\\section{{Related Works}}\n{introduccion}\n\n{cuerpo}\n\n{descripcion}\n\n% [Tabla Fallback]\n\n{conclusion}\n\n{bloque_bibliografia_latex}"
+        
+        mensaje_error = (
+            "⚠️ **Ocurrió una anomalía durante la optimización tipográfica avanzada de LaTeX.**\n"
+            "No obstante, se ha generado un bloque estructurado de contingencia (*fallback*) combinando los módulos en texto lineal."
+        )
+        return {
+            "related_works_document": fallback_latex,
+            "error": str(e),
+            "messages": [AIMessage(content=mensaje_error)]
+        }
 
 # ------------------------------------ GRAFO ------------------------------------------
 
 graph = StateGraph(AgentState)
 
+graph.add_node("seleccionar_idioma", seleccionar_idioma_node)
 graph.add_node("definir_tematica", definir_tematica_node)
 graph.add_node("buscar_pdfs", buscar_pdfs_node)
 graph.add_node("leer_texto", leer_texto_node)
@@ -1107,8 +1777,10 @@ graph.add_node("modificar_estructura", modificar_estructura_node)
 graph.add_node("generar_tabla", generar_tabla_node)
 graph.add_node("describir_tabla", describir_tabla_node)
 graph.add_node("redactar_conclusion", redactar_conclusion_node)
+graph.add_node("revision_final", revision_final_node)
 
-graph.add_edge(START, "definir_tematica")
+graph.add_edge(START, "seleccionar_idioma")
+graph.add_edge("seleccionar_idioma", "definir_tematica")
 graph.add_edge("definir_tematica", "buscar_pdfs")
 graph.add_edge("buscar_pdfs", "leer_texto")
 graph.add_edge("leer_texto", "analizar_trabajos")
@@ -1158,7 +1830,8 @@ graph.add_conditional_edges(
     {
         "generar_tabla": "generar_tabla",
         "proponer_estructura": "proponer_estructura",
-        "modificar_estructura": "modificar_estructura"
+        "modificar_estructura": "modificar_estructura",
+        "redactar_conclusion": "redactar_conclusion"
     }
 )
 
@@ -1166,14 +1839,31 @@ graph.add_edge("modificar_estructura", "confirmar_estructura")
 
 graph.add_edge("generar_tabla", "describir_tabla")
 graph.add_edge("describir_tabla", "redactar_conclusion")
-graph.add_edge("redactar_conclusion", END)
+graph.add_edge("redactar_conclusion", "revision_final")
+graph.add_edge("revision_final", END)
 
 app = graph.compile()
 
 # --------------------------------------------- EJECUCION ----------------------------
 
 if __name__ == "__main__":
+
+    mensaje_bienvenida = """Bienvenido a AI Related Works Agent
+Un agente de IA diseñado para ayudarte a redactar la sección 'Related Works' de tu paper científico con calidad y mínimo esfuerzo.
+
+Antes de empezar:
+Asegúrate de haber colocado los PDFs o documentos que quieres analizar dentro de la carpeta `trabajos_relacionados`.
+
+Configuración Inicial:
+Lo primero que debemos hacer es elegir el idioma de salida de la redacción.
+
+Opciones de idioma:
+  1 → Español Académico
+  2 → Inglés Académico
+"""
+
     init_state = {
+        "idioma_salida": "",
         "tema_paper": "",
         "trabajos_pdf": [],
         "textos_trabajos": [],
@@ -1191,30 +1881,39 @@ if __name__ == "__main__":
         "tabla_comparativa_generada": "",
         "descripcion_tabla": "",
         "conclusion_related_work": "",
-        "messages": [],
+        "messages": [AIMessage(content=mensaje_bienvenida)],
         "error": None
     }
+
+    print(f"\n🤖 Agente AI:\n{init_state['messages'][0].content}")
 
     for step in app.stream(init_state):
         for node_name, node_state in step.items():
             init_state.update(node_state)
             
             if "messages" in node_state:
-                ultimo_msg = node_state["messages"][-1]
-                if isinstance(ultimo_msg, AIMessage):
-                    print(f"\n🤖 Agente [{node_name}]:\n{ultimo_msg.content}")
+                # Iteramos por todos los mensajes nuevos que ha generado este nodo
+                for msg in node_state["messages"]:
+                    if isinstance(msg, HumanMessage):
+                        print(f"\n👤 Humano:\n> {msg.content}")
+                    elif isinstance(msg, AIMessage):
+                        print(f"\n🤖 Agente AI:\n{msg.content}")
+                #print("\n" + "="*60) # Línea divisoria elegante al terminar el nodo
 
     guardar_state(init_state, "state_guardado.json")
 
-    print("\n--- 📊 RESUMEN FINAL ---")
-    print(json.dumps(init_state.get("trabajos_analizados", []), indent=2, ensure_ascii=False))
+    guardar_documento_latex(init_state, "related_works.tex")
 
-    print("\n📘 INTRODUCCIÓN GENERADA:\n")
-    print(init_state["introduccion_related_works"])
+    #print("\n--- 📊 RESUMEN FINAL ---")
+    #print(json.dumps(init_state.get("trabajos_analizados", []), indent=2, ensure_ascii=False))
 
-    print("\n📚 CUERPO RELATED WORKS:\n")
-    print(init_state["related_works_section"])
+    #print("\n📘 INTRODUCCIÓN GENERADA:\n")
+    #print(init_state["introduccion_related_works"])
 
-    print("\n📊 TABLA:\n", init_state.get("tabla_comparativa_generada", ""))
-    print("\n🧾 DESCRIPCIÓN:\n", init_state.get("descripcion_tabla", ""))
-    print("\n📌 CONCLUSIÓN:\n", init_state.get("conclusion_related_work", ""))
+    #print("\n📚 CUERPO RELATED WORKS:\n")
+    #print(init_state["related_works_section"])
+
+    #print("\n📊 TABLA:\n", init_state.get("tabla_comparativa_generada", ""))
+    #print("\n🧾 DESCRIPCIÓN:\n", init_state.get("descripcion_tabla", ""))
+    #print("\n📌 CONCLUSIÓN:\n", init_state.get("conclusion_related_work", ""))
+    #print("\n🧾 TEXTO FINAL:\n", init_state.get("related_works_document", ""))
