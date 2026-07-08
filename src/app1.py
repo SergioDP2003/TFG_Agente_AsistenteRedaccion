@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
@@ -186,9 +188,13 @@ def seleccionar_idioma_node(state: AgentState) -> AgentState:
         "2": "Inglés académico (English)"
     }
 
+    # El menú de idiomas ya se muestra en el mensaje de bienvenida inicial,
+    # así que no repetimos el texto aquí salvo que la opción sea inválida.
+    mensaje_interrupcion = ""
+
     while True:
-        
-        opcion = input().strip()
+
+        opcion = interrupt(mensaje_interrupcion).strip()
 
         if opcion in mapa_idiomas:
             idioma_elegido = mapa_idiomas[opcion]
@@ -208,12 +214,12 @@ def seleccionar_idioma_node(state: AgentState) -> AgentState:
                 ]
             }
         else:
-            print("⚠️ Opción inválida. Por favor, introduce un número del 1 al 2.")
+            mensaje_interrupcion = "⚠️ Opción inválida. Por favor, introduce un número del 1 al 2."
 
 def definir_tematica_node(state: AgentState) -> AgentState:
 
-    # Capturamos la descripción del usuario
-    tema_usuario = input()
+    # Capturamos la descripción del usuario (el nodo anterior ya explica qué se le pide)
+    tema_usuario = interrupt("")
     
     prompt = f"""
     Analiza la descripción del paper que está escribiendo el usuario. Tu tarea es extraer y rellenar la ficha técnica formal de SU propia investigación utilizando el esquema estructurado. Infere los aspectos técnicos basándote en su explicación.
@@ -454,9 +460,14 @@ def decision_categorizacion_node(state: AgentState) -> AgentState:
     que ha realizado el agente tras el análisis de los trabajos.
     """
 
+    # interrupt() debe quedar FUERA del try/except: internamente se implementa
+    # lanzando una excepción para pausar el grafo, y un `except Exception` la
+    # capturaría como si fuera un error real, saltándose la pausa por completo.
+    decision = interrupt("")
+
     try:
 
-        decision = input().strip().lower()
+        decision = decision.strip().lower()
 
         if decision not in ["s", "n"]:
             return {
@@ -524,7 +535,7 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
 
     try:
         # Forzamos una temperatura baja para evitar nombres creativos largos
-        res = categorias_llm.invoke(prompt)
+        res = categorias_llm3.invoke(prompt)
         propuesta_dict = res.model_dump()
 
         asignados = set()
@@ -601,83 +612,76 @@ def confirmar_categorias_node(state: AgentState) -> AgentState:
     4. Rechazar la inclusión de categorías.
     """
 
-    try:
+    # El menú de opciones ya se muestra en el AIMessage del nodo anterior.
+    # interrupt() debe quedar FUERA de cualquier try/except: internamente se
+    # implementa lanzando una excepción para pausar el grafo, así que un
+    # `except Exception` la capturaría como si fuera un error real y se
+    # saltaría la pausa por completo.
+    decision = interrupt("").strip()
 
-        decision = input().strip()
-
-        if decision not in ["1", "2", "3", "4"]:
-            return {
-                "error": "Respuesta inválida.",
-                "messages": [
-                    AIMessage(content="La opción seleccionada no es válida. Debes elegir 1, 2 , 3 o 4.")
-                ]
-            }
-
-        if decision == "1":
-            return {
-                "categorias_confirmadas": True,
-                "accion_categorias": "aceptar",
-                "error": None,
-                "messages": [
-                    HumanMessage(content="Opción 1: Apruebo la estructura de categorías propuesta."),
-                    AIMessage(content="Excelente. Estructura fijada. Procediendo a redactar la introducción de la sección Related Works...")
-                ]
-            }
-
-        # OPCIÓN 2: Pedir nuevas categorías (Regenerar con otro enfoque)
-        if decision == "2":
-            return {
-                "categorias_confirmadas": False,
-                "accion_categorias": "regenerar",
-                "error": None,
-                "messages": [
-                    HumanMessage(content="Opción 2: No me convence esta agrupación, solicita generar nuevas categorías."),
-                    AIMessage(content="Entendido. Reorientando el análisis para ofrecerte una alternativa...")
-                ]
-            }
-
-        # OPCIÓN 3: Modificar de forma personalizada
-        if decision == "3":
-            print("\n" + "-"*50)
-            print("INSTRUCCIONES DE MODIFICACIÓN")
-            print("Indica qué deseas cambiar (ej: 'Cambia el nombre de la categoría 1 a Modelos de Lenguaje' o 'Mueve el paper X a la categoría 2').")
-            print("-"*50)
-            
-            instrucciones = input().strip()
-
-            return {
-                "categorias_confirmadas": False,
-                "accion_categorias": "modificar",
-                "instrucciones_modificacion": instrucciones,
-                "error": None,
-                "messages": [
-                    HumanMessage(content=f"Opción 3: Deseo ajustar las categorías con los siguientes cambios: '{instrucciones}'"),
-                    AIMessage(content="Modificaciones registradas. Ajustando el esquema de categorías según tus indicaciones...")
-                ]
-            }
-        
-        # OPCIÓN 4: Rechazar y avanzar en texto plano
-        if decision == "4":
-            return {
-                "categorizar_activo": False,
-                "categorias_confirmadas": False,
-                "accion_categorias": "rechazar",
-                "error": None,
-                "messages": [
-                    HumanMessage(content="Opción 4: Prefiero prescindir de las categorías y redactar la sección de corrido."),
-                    AIMessage(content="Entendido. Desactivando categorías. Preparando la estrategia para una redacción lineal unificada...")
-                ]
-            }
-
-    except Exception as e:
-        print(f"⚠️ Error en la toma de decisión: {e}")
+    if decision not in ["1", "2", "3", "4"]:
         return {
-            "error": f"Error confirmando categorías: {str(e)}",
+            "error": "Respuesta inválida.",
             "messages": [
-                AIMessage(content=f"Excepción en el nodo de confirmación: {str(e)}")
+                AIMessage(content="La opción seleccionada no es válida. Debes elegir 1, 2 , 3 o 4.")
             ]
         }
-    
+
+    if decision == "1":
+        return {
+            "categorias_confirmadas": True,
+            "accion_categorias": "aceptar",
+            "error": None,
+            "messages": [
+                HumanMessage(content="Opción 1: Apruebo la estructura de categorías propuesta."),
+                AIMessage(content="Excelente. Estructura fijada. Procediendo a redactar la introducción de la sección Related Works...")
+            ]
+        }
+
+    # OPCIÓN 2: Pedir nuevas categorías (Regenerar con otro enfoque)
+    if decision == "2":
+        return {
+            "categorias_confirmadas": False,
+            "accion_categorias": "regenerar",
+            "error": None,
+            "messages": [
+                HumanMessage(content="Opción 2: No me convence esta agrupación, solicita generar nuevas categorías."),
+                AIMessage(content="Entendido. Reorientando el análisis para ofrecerte una alternativa...")
+            ]
+        }
+
+    # OPCIÓN 3: Modificar de forma personalizada
+    if decision == "3":
+        instrucciones = interrupt(
+            "INSTRUCCIONES DE MODIFICACIÓN\n"
+            "Indica qué deseas cambiar (ej: 'Cambia el nombre de la categoría 1 a Modelos de Lenguaje' "
+            "o 'Mueve el paper X a la categoría 2')."
+        ).strip()
+
+        return {
+            "categorias_confirmadas": False,
+            "accion_categorias": "modificar",
+            "instrucciones_modificacion": instrucciones,
+            "error": None,
+            "messages": [
+                HumanMessage(content=f"Opción 3: Deseo ajustar las categorías con los siguientes cambios: '{instrucciones}'"),
+                AIMessage(content="Modificaciones registradas. Ajustando el esquema de categorías según tus indicaciones...")
+            ]
+        }
+
+    # OPCIÓN 4: Rechazar y avanzar en texto plano
+    if decision == "4":
+        return {
+            "categorizar_activo": False,
+            "categorias_confirmadas": False,
+            "accion_categorias": "rechazar",
+            "error": None,
+            "messages": [
+                HumanMessage(content="Opción 4: Prefiero prescindir de las categorías y redactar la sección de corrido."),
+                AIMessage(content="Entendido. Desactivando categorías. Preparando la estrategia para una redacción lineal unificada...")
+            ]
+        }
+
 def gateway_categorias(state: AgentState):
 
     accion = state.get("accion_categorias")
@@ -978,7 +982,7 @@ def redactar_trabajos_relacionados_node(state: AgentState) -> AgentState:
 
     try:
         # Invocación directa
-        response = llm.invoke(prompt)
+        response = llm3.invoke(prompt)
         
         # Limpieza estándar de artefactos de formato markdown que suele arrojar el LLM
         texto_redactado = response.content.replace("###", "").replace("**", "").strip()
@@ -1074,9 +1078,14 @@ def recomendar_tabla_node(state: AgentState):
 
 def decision_tabla_node(state: AgentState):
 
+    # El nodo anterior ya muestra la pregunta (s/n) en su AIMessage.
+    # interrupt() debe quedar FUERA del try/except: internamente se implementa
+    # lanzando una excepción para pausar el grafo, y un `except Exception` la
+    # capturaría como si fuera un error real, saltándose la pausa por completo.
+    dec = interrupt("")
+
     try:
-        # Lanzamos el input de forma clara guiando al usuario
-        dec = input().strip().lower()
+        dec = dec.strip().lower()
 
         # Validación básica por si el usuario introduce una opción incorrecta
         if dec not in ["s", "n"]:
@@ -1093,10 +1102,10 @@ def decision_tabla_node(state: AgentState):
 
         # Mensajes con enfoque conversacional en primera persona
         texto_humano = "Sí, por favor, genera una tabla comparativa para resumir visualmente los trabajos." if activa else "No, prefiero avanzar sin incluir una tabla comparativa en esta sección."
-        
+
         texto_agente = (
             "Elección registrada. Procediendo a analizar los papers para proponer las columnas y criterios de comparación..."
-            if activa else 
+            if activa else
             "Entendido. Saltaremos la fase construcción de una tabla comparativa y avanzaremos directamente hacia las conclusiones de la sección."
         )
 
@@ -1180,7 +1189,7 @@ Si no puedes → null
     # 🔁 REINTENTOS AUTOMÁTICOS
     for _ in range(3):
 
-        res = llm.invoke(prompt)
+        res = llm3.invoke(prompt)
         nueva = extraer_json(res.content)
 
         if not nueva:
@@ -1220,7 +1229,8 @@ Si no puedes → null
 
 def confirmar_estructura_node(state: AgentState):
 
-    opcion = input().strip()
+    # El menú de opciones ya se muestra en el AIMessage del nodo anterior.
+    opcion = interrupt("").strip()
 
     if opcion == "1":
         return {
@@ -1245,8 +1255,10 @@ def confirmar_estructura_node(state: AgentState):
         }
 
     elif opcion == "3":
-        instrucciones = input("\nIndica los cambios (ej. 'Quita la columna X y añade una columna para el Dataset utilizado'):\n> ").strip()
-            
+        instrucciones = interrupt(
+            "Indica los cambios (ej. 'Quita la columna X y añade una columna para el Dataset utilizado'):"
+        ).strip()
+
         return {
             "estructura_tabla_confirmada": False,
             "accion_estructura": "modificar",
@@ -1271,7 +1283,12 @@ def confirmar_estructura_node(state: AgentState):
         }
 
     else:
-        print("⚠️ Opción inválida. Por favor, introduce un número del 1 al 4.")
+        return {
+            "error": "Respuesta inválida en estructura de tabla.",
+            "messages": [
+                AIMessage(content="⚠️ Opción inválida. Por favor, introduce un número del 1 al 4.")
+            ]
+        }
 
 def modificar_estructura_node(state: AgentState):
 
@@ -1425,7 +1442,7 @@ EJEMPLO DE CELDA INCORRECTA:
 Si no puedes cumplir TODAS las reglas, la respuesta es inválida.
 """
 
-    res = llm.invoke(prompt)
+    res = llm3.invoke(prompt)
 
     tabla_markdown = res.content.strip()
 
@@ -1699,7 +1716,7 @@ def revision_final_node(state: AgentState):
     """
 
     try:
-        response = llm.invoke(prompt)
+        response = llm3.invoke(prompt)
         texto_final_latex = response.content.strip()
         
         # Aseguramos el bloque de cierre por si el LLM sufriera algún truncamiento menor
@@ -1842,13 +1859,11 @@ graph.add_edge("describir_tabla", "redactar_conclusion")
 graph.add_edge("redactar_conclusion", "revision_final")
 graph.add_edge("revision_final", END)
 
-app = graph.compile()
+app = graph.compile(checkpointer=MemorySaver())
 
 # --------------------------------------------- EJECUCION ----------------------------
 
-if __name__ == "__main__":
-
-    mensaje_bienvenida = """Bienvenido a AI Related Works Agent
+MENSAJE_BIENVENIDA = """Bienvenido a AI Related Works Agent
 Un agente de IA diseñado para ayudarte a redactar la sección 'Related Works' de tu paper científico con calidad y mínimo esfuerzo.
 
 Antes de empezar:
@@ -1862,7 +1877,9 @@ Opciones de idioma:
   2 → Inglés Académico
 """
 
-    init_state = {
+def crear_estado_inicial() -> AgentState:
+    """Construye un AgentState nuevo para arrancar una sesión del grafo (consola o GUI)."""
+    return {
         "idioma_salida": "",
         "tema_paper": "",
         "trabajos_pdf": [],
@@ -1877,43 +1894,55 @@ Opciones de idioma:
         "estructura_tabla_propuesta": [],
         "estructura_tabla_confirmada": "",
         "accion_estructura": "",
-        "instrucciones_tabla": "", 
+        "instrucciones_tabla": "",
         "tabla_comparativa_generada": "",
         "descripcion_tabla": "",
         "conclusion_related_work": "",
-        "messages": [AIMessage(content=mensaje_bienvenida)],
+        "messages": [AIMessage(content=MENSAJE_BIENVENIDA)],
         "error": None
     }
 
-    print(f"\n🤖 Agente AI:\n{init_state['messages'][0].content}")
+if __name__ == "__main__":
+    import uuid
 
-    for step in app.stream(init_state):
-        for node_name, node_state in step.items():
-            init_state.update(node_state)
-            
-            if "messages" in node_state:
-                # Iteramos por todos los mensajes nuevos que ha generado este nodo
-                for msg in node_state["messages"]:
-                    if isinstance(msg, HumanMessage):
-                        print(f"\n👤 Humano:\n> {msg.content}")
-                    elif isinstance(msg, AIMessage):
-                        print(f"\n🤖 Agente AI:\n{msg.content}")
-                #print("\n" + "="*60) # Línea divisoria elegante al terminar el nodo
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
 
-    guardar_state(init_state, "state_guardado.json")
+    entrada = crear_estado_inicial()
+    num_mensajes_impresos = 0
+    ultimo_chunk = {}
 
-    guardar_documento_latex(init_state, "related_works.tex")
+    # NOTA: nos apoyamos en el propio contenido del stream (clave "__interrupt__" del
+    # último chunk) para saber si el grafo sigue pausado o ha llegado a END, en vez de
+    # `app.get_state(config).next`: cuando un nodo lanza más de un interrupt() distinto
+    # (p.ej. el menú "modificar" de categorías/tabla), ese `.next` deja de ser fiable
+    # justo después del primer resume, aunque el grafo siga correctamente pausado.
+    while True:
+        for chunk in app.stream(entrada, config, stream_mode="values"):
+            ultimo_chunk = chunk
+            if "__interrupt__" in chunk:
+                continue
+            mensajes = chunk.get("messages", [])
+            for msg in mensajes[num_mensajes_impresos:]:
+                if isinstance(msg, HumanMessage):
+                    print(f"\n👤 Humano:\n> {msg.content}")
+                elif isinstance(msg, AIMessage):
+                    print(f"\n🤖 Agente AI:\n{msg.content}")
+            num_mensajes_impresos = len(mensajes)
 
-    #print("\n--- 📊 RESUMEN FINAL ---")
-    #print(json.dumps(init_state.get("trabajos_analizados", []), indent=2, ensure_ascii=False))
+        if "__interrupt__" not in ultimo_chunk:
+            # El grafo ha llegado a END
+            break
 
-    #print("\n📘 INTRODUCCIÓN GENERADA:\n")
-    #print(init_state["introduccion_related_works"])
+        valor_interrupcion = ultimo_chunk["__interrupt__"][0].value
+        if valor_interrupcion:
+            print(f"\n🤖 Agente AI:\n{valor_interrupcion}")
 
-    #print("\n📚 CUERPO RELATED WORKS:\n")
-    #print(init_state["related_works_section"])
+        respuesta_usuario = input("\n> ")
+        entrada = Command(resume=respuesta_usuario)
 
-    #print("\n📊 TABLA:\n", init_state.get("tabla_comparativa_generada", ""))
-    #print("\n🧾 DESCRIPCIÓN:\n", init_state.get("descripcion_tabla", ""))
-    #print("\n📌 CONCLUSIÓN:\n", init_state.get("conclusion_related_work", ""))
-    #print("\n🧾 TEXTO FINAL:\n", init_state.get("related_works_document", ""))
+    estado_final = ultimo_chunk
+
+    guardar_state(estado_final, "state_guardado.json")
+
+    guardar_documento_latex(estado_final, "related_works.tex")
