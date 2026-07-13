@@ -3,7 +3,7 @@ src/state_guardado.json
 related_works.tex
 CLAUDE.md
 .claudeignore
-
+grafo_agente.png
 
 __pycache__/
 *.py[cod]
