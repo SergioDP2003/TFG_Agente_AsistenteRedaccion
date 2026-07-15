@@ -1,4 +1,5 @@
 .env
+src/llm_config.json
 src/state_guardado.json
 related_works.tex
 CLAUDE.md

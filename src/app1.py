@@ -13,22 +13,132 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_ollama import ChatOllama
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-llm = ChatOllama(model="llama3.2:3b", temperature=0.1)
-llm2 = ChatOllama(model="qwen2.5:7b", temperature=0.1)
-llm3 = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.3, 
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-)
+# ------------------------------- CONFIGURACIÓN DE LOS LLM ----------------------------------
+#
+# El agente usa 2 "slots" de modelo configurables desde la página de Ajustes de la GUI:
+#   - "simple":   tareas menos exigentes (extracción, evaluación, párrafos cortos).
+#   - "complejo": tareas más exigentes (propuesta de categorías, redacción del cuerpo,
+#                 generación de la tabla, ensamblado final en LaTeX).
+# Cada slot puede apuntar a un modelo local de Ollama o a un servicio externo por API key.
+# `init_chat_model` (de LangChain) resuelve la clase concreta (ChatOllama,
+# ChatGoogleGenerativeAI, ChatOpenAI, ChatAnthropic...) a partir del nombre de proveedor,
+# siempre que el paquete langchain-<proveedor> correspondiente esté instalado.
+
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+RUTA_LLM_CONFIG = os.path.join(_SRC_DIR, "llm_config.json")
+
+PROVEEDORES_LLM = {
+    "ollama": {
+        "etiqueta": "Ollama (modelo local)",
+        "api_key_env": None,
+        "modelo_defecto": "llama3.2:3b",
+    },
+    "google_genai": {
+        "etiqueta": "Google Gemini (API)",
+        "api_key_env": "GOOGLE_API_KEY",
+        "modelo_defecto": "gemini-2.5-flash",
+    },
+    "openai": {
+        "etiqueta": "OpenAI (API)",
+        "api_key_env": "OPENAI_API_KEY",
+        "modelo_defecto": "gpt-4o-mini",
+    },
+    "anthropic": {
+        "etiqueta": "Anthropic Claude (API)",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "modelo_defecto": "claude-3-5-haiku-latest",
+    },
+}
+
+# Configuración de fábrica: reproduce el comportamiento previo a que esto fuera
+# configurable (llama3.2:3b local para tareas simples, Gemini para las complejas).
+CONFIG_LLM_DEFECTO = {
+    "simple": {"proveedor": "ollama", "modelo": "llama3.2:3b", "temperature": 0.1},
+    "complejo": {"proveedor": "google_genai", "modelo": "gemini-2.5-flash", "temperature": 0.3},
+}
+
+
+def cargar_configuracion_llms() -> dict:
+    """Lee src/llm_config.json (creado/editado desde la página de Ajustes de la GUI).
+    Si el fichero no existe todavía o está corrupto, se usa la configuración de fábrica."""
+    if os.path.exists(RUTA_LLM_CONFIG):
+        try:
+            with open(RUTA_LLM_CONFIG, "r", encoding="utf-8") as f:
+                datos = json.load(f)
+            return {
+                "simple": {**CONFIG_LLM_DEFECTO["simple"], **datos.get("simple", {})},
+                "complejo": {**CONFIG_LLM_DEFECTO["complejo"], **datos.get("complejo", {})},
+            }
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {slot: dict(cfg) for slot, cfg in CONFIG_LLM_DEFECTO.items()}
+
+
+def guardar_configuracion_llms(config: dict):
+    """Escribe src/llm_config.json desde cero (lo llama la página de Ajustes de la GUI)."""
+    with open(RUTA_LLM_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def crear_llm(config_slot: dict):
+    """Instancia un chat model a partir de un slot de configuración
+    ({"proveedor", "modelo", "temperature"}) usando `init_chat_model`."""
+    proveedor = config_slot.get("proveedor", "ollama")
+    info_proveedor = PROVEEDORES_LLM.get(proveedor, PROVEEDORES_LLM["ollama"])
+
+    kwargs = {
+        "model": config_slot.get("modelo") or info_proveedor["modelo_defecto"],
+        "model_provider": proveedor,
+        "temperature": config_slot.get("temperature", 0.2),
+    }
+
+    clave_env = info_proveedor.get("api_key_env")
+    if clave_env:
+        valor = os.getenv(clave_env)
+        if valor:
+            kwargs["api_key"] = valor
+
+    return init_chat_model(**kwargs)
+
+
+class LLMPerezoso:
+    """Envoltorio que retrasa la construcción real del modelo hasta el primer uso.
+
+    Antes, `llm`/`llm3` se construían a nivel de módulo: si faltaba la API key de
+    Gemini, el simple `import app1` ya lanzaba una excepción (ver README/CLAUDE.md).
+    Con este envoltorio, un proveedor mal configurado (API key ausente, paquete no
+    instalado, modelo inexistente) no impide importar el módulo: el error solo
+    aparece cuando el nodo que de verdad invoca ese modelo se ejecuta. Además, como
+    la configuración se relee de `llm_config.json` en el primer uso (no en el
+    import), guardar cambios desde Ajustes puede surtir efecto sin reiniciar el
+    proceso, siempre que ningún nodo haya usado ya ese slot en el proceso actual.
+    """
+
+    def __init__(self, slot: str):
+        self._slot = slot
+        self._modelo = None
+
+    def _resolver(self):
+        if self._modelo is None:
+            config = cargar_configuracion_llms()[self._slot]
+            self._modelo = crear_llm(config)
+        return self._modelo
+
+    def invoke(self, *args, **kwargs):
+        return self._resolver().invoke(*args, **kwargs)
+
+    def with_structured_output(self, *args, **kwargs):
+        return self._resolver().with_structured_output(*args, **kwargs)
+
+
+llm_simple = LLMPerezoso("simple")
+llm_complejo = LLMPerezoso("complejo")
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -79,11 +189,6 @@ class Categoria(BaseModel):
 
 class PropuestaCategorias(BaseModel):
     categorias: List[Categoria] = Field(description="Lista de máximo 3 categorías en base a los trabajos existentes.")
-
-analisis_llm = llm.with_structured_output(PaperEstructurado)
-categorias_llm = llm.with_structured_output(PropuestaCategorias)
-
-categorias_llm3 = llm3.with_structured_output(PropuestaCategorias)
 
 # -------------------------------- METODOS AUXILIARES -------------------------------------
 
@@ -230,7 +335,7 @@ def definir_tematica_node(state: AgentState) -> AgentState:
     
     try:
         # Forzamos al LLM a escupir la estructura idéntica a la de los papers analizados
-        llm_estructurado = llm.with_structured_output(PaperEstructurado)
+        llm_estructurado = llm_simple.with_structured_output(PaperEstructurado)
         res_pydantic = llm_estructurado.invoke(prompt)
         
         # Guardamos como diccionario estándar
@@ -365,7 +470,7 @@ def analizar_trabajos_node(state: AgentState):
     analizados = []
     reporte_titulos = []
     
-    structured_llm = llm.with_structured_output(PaperEstructurado)
+    structured_llm = llm_simple.with_structured_output(PaperEstructurado)
     
     for i, texto in enumerate(state["textos_trabajos"]):
         fragmento = texto[:12000]
@@ -440,7 +545,7 @@ def evaluar_categorizacion_node(state: AgentState) -> AgentState:
     Responde con Sí o No junto con una breve explicación del por qué. La explicación de máximo 1 párrafo de 50 palabras.
     """
 
-    response = llm.invoke(prompt)
+    response = llm_simple.invoke(prompt)
 
     mensaje_salida = (
         f"¿Te recomiendo añadir una división por categorías?\n"
@@ -535,7 +640,7 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
 
     try:
         # Forzamos una temperatura baja para evitar nombres creativos largos
-        res = categorias_llm3.invoke(prompt)
+        res = llm_complejo.with_structured_output(PropuestaCategorias).invoke(prompt)
         propuesta_dict = res.model_dump()
 
         asignados = set()
@@ -745,7 +850,7 @@ def modificar_categorias_node(state: AgentState) -> AgentState:
       ]
     }}
     """
-    response = llm.invoke(prompt)
+    response = llm_simple.invoke(prompt)
 
     # Función para extraer JSON del texto del LLM
     def extraer_json(texto: str):
@@ -865,8 +970,8 @@ def redactar_introduccion_node(state: AgentState) -> AgentState:
         """
 
     try:
-        response = llm.invoke(prompt)
-        
+        response = llm_simple.invoke(prompt)
+
         texto_sucio = response.content.strip()
         lineas = texto_sucio.split('\n')
 
@@ -982,7 +1087,7 @@ def redactar_trabajos_relacionados_node(state: AgentState) -> AgentState:
 
     try:
         # Invocación directa
-        response = llm3.invoke(prompt)
+        response = llm_complejo.invoke(prompt)
         
         # Limpieza estándar de artefactos de formato markdown que suele arrojar el LLM
         texto_redactado = response.content.replace("###", "").replace("**", "").strip()
@@ -1039,7 +1144,7 @@ def recomendar_tabla_node(state: AgentState):
     Justificación: [Escribe una justificación científica, breve y con razones de peso]
     """
 
-    res = llm.invoke(prompt)
+    res = llm_simple.invoke(prompt)
 
     contenido_recomendacion = res.content.strip()
 
@@ -1189,7 +1294,7 @@ Si no puedes → null
     # 🔁 REINTENTOS AUTOMÁTICOS
     for _ in range(3):
 
-        res = llm3.invoke(prompt)
+        res = llm_complejo.invoke(prompt)
         nueva = extraer_json(res.content)
 
         if not nueva:
@@ -1329,7 +1434,7 @@ IMPORTANTE:
 Si no puedes generar JSON válido → devuelve null
 """
 
-    res = llm.invoke(prompt)
+    res = llm_simple.invoke(prompt)
     nueva = extraer_json(res.content)
 
     if not nueva or "columnas" not in nueva:
@@ -1442,7 +1547,7 @@ EJEMPLO DE CELDA INCORRECTA:
 Si no puedes cumplir TODAS las reglas, la respuesta es inválida.
 """
 
-    res = llm3.invoke(prompt)
+    res = llm_complejo.invoke(prompt)
 
     tabla_markdown = res.content.strip()
 
@@ -1519,7 +1624,7 @@ SALIDA:
 Solo el texto (sin encabezados tipo "Descripción de la tabla")
 """
 
-    res = llm.invoke(prompt)
+    res = llm_simple.invoke(prompt)
     texto_descripcion = res.content.strip()
 
     # --- REPORTE CONVERSACIONAL UNIFICADO ---
@@ -1612,7 +1717,7 @@ SALIDA:
 Solo el párrafo.
 """
 
-    res = llm.invoke(prompt)
+    res = llm_simple.invoke(prompt)
     parrafo_conclusion = res.content.strip()
 
     # --- REPORTE CONVERSACIONAL DE CIERRE DE GENERACIÓN ---
@@ -1716,7 +1821,7 @@ def revision_final_node(state: AgentState):
     """
 
     try:
-        response = llm3.invoke(prompt)
+        response = llm_complejo.invoke(prompt)
         texto_final_latex = response.content.strip()
         
         # Aseguramos el bloque de cierre por si el LLM sufriera algún truncamiento menor

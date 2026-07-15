@@ -2,14 +2,17 @@
 Interfaz web (Gradio) para el agente de LangGraph definido en app1.py.
 
 Este módulo no contiene lógica de negocio del grafo: reutiliza el grafo ya
-compilado (`app`), el constructor de estado inicial (`crear_estado_inicial`)
-y las funciones de guardado (`guardar_state`, `guardar_documento_latex`) de
-`app1.py`. Su responsabilidad es doble:
+compilado (`app`), el constructor de estado inicial (`crear_estado_inicial`),
+las funciones de guardado (`guardar_state`, `guardar_documento_latex`) y la
+configuración de los LLM (`PROVEEDORES_LLM`, `cargar_configuracion_llms`,
+`guardar_configuracion_llms`) de `app1.py`. Su responsabilidad es triple:
   1. Traducir cada pausa por `interrupt()` del grafo en una interacción de
      chat: mostrar el historial acumulado y reanudar la ejecución con
      `Command(resume=...)` cuando el usuario envía texto.
   2. Ofrecer una página de "Ajustes" para gestionar gráficamente la carpeta
-     `trabajos_relacionados/` y el archivo `src/.env`.
+     `trabajos_relacionados/`, el archivo `src/.env` y los 2 modelos LLM
+     ("simple" y "complejo") que usa el agente.
+  3. Persistir esa configuración de modelos en `src/llm_config.json`.
 """
 
 import os
@@ -23,37 +26,28 @@ from langgraph.types import Command
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 RUTA_ENV = os.path.join(_SRC_DIR, ".env")
-RUTA_ENV_EXAMPLE = os.path.join(_SRC_DIR, ".env.example")
 CARPETA_PDFS = "trabajos_relacionados"
 
-
-def _claves_env_esperadas():
-    """Lee los nombres de variable esperados desde src/.env.example."""
-    claves = []
-    if os.path.exists(RUTA_ENV_EXAMPLE):
-        with open(RUTA_ENV_EXAMPLE, "r", encoding="utf-8") as f:
-            for linea in f:
-                linea = linea.strip()
-                if linea and not linea.startswith("#") and "=" in linea:
-                    claves.append(linea.split("=", 1)[0].strip())
-    return claves or ["GOOGLE_API_KEY"]
-
-
-CLAVES_ENV = _claves_env_esperadas()
-
-# app1.py instancia ChatGoogleGenerativeAI a nivel de módulo, lo que exige que
-# GOOGLE_API_KEY (u otras claves de src/.env.example) ya estén presentes en el
-# entorno en el momento del `import`. La primera vez que se abre la GUI puede
-# que src/.env todavía no exista (es precisamente lo que la página de Ajustes
-# permite crear), así que cargamos el .env real si existe y, para cualquier
-# clave que siga faltando, fijamos un valor de relleno para que el import no
-# falle. El usuario deberá reiniciar la app tras guardar sus claves reales.
+# Cargamos el .env real (si existe) antes de importar app1, para que
+# `crear_llm`/`LLMPerezoso` puedan resolver las API keys en su primer uso real.
+# A diferencia de la versión anterior de este fichero, ya NO hace falta rellenar
+# variables de relleno para evitar un fallo en el import: app1.py construye los
+# modelos de forma perezosa (ver `LLMPerezoso`), así que importar el módulo es
+# siempre seguro, exista o no exista `src/.env` todavía.
 if os.path.exists(RUTA_ENV):
     load_dotenv(RUTA_ENV)
-for _clave in CLAVES_ENV:
-    os.environ.setdefault(_clave, "pendiente-de-configurar")
 
-from app1 import app, crear_estado_inicial, guardar_state, guardar_documento_latex  # noqa: E402
+from app1 import (  # noqa: E402
+    app,
+    crear_estado_inicial,
+    guardar_state,
+    guardar_documento_latex,
+    PROVEEDORES_LLM,
+    cargar_configuracion_llms,
+    guardar_configuracion_llms,
+)
+
+CLAVES_ENV = sorted({info["api_key_env"] for info in PROVEEDORES_LLM.values() if info["api_key_env"]})
 
 MENSAJE_FINALIZADO = (
     "✅ Proceso completado. Se han guardado `src/state_guardado.json` y `related_works.tex`."
@@ -196,9 +190,50 @@ def guardar_env(*valores):
     contenido = "\n".join(f"{clave}={valor}" for clave, valor in zip(CLAVES_ENV, valores)) + "\n"
     with open(RUTA_ENV, "w", encoding="utf-8") as f:
         f.write(contenido)
+
+    # Reflejamos también los valores en el proceso actual: si el LLM correspondiente
+    # todavía no se ha resuelto (ver LLMPerezoso en app1.py), la clave nueva se
+    # recogerá sin necesidad de reiniciar la aplicación.
+    for clave, valor in zip(CLAVES_ENV, valores):
+        if valor:
+            os.environ[clave] = valor
+
     return (
         f"✅ Variables guardadas en `src/.env` ({', '.join(CLAVES_ENV)}). "
-        "Reinicia la aplicación (`python src/gui.py`) para que los cambios tengan efecto."
+        "Si algún modelo ya se había usado en esta sesión, reinicia la aplicación "
+        "(`python src/gui.py`) para que recoja la clave nueva."
+    )
+
+
+# ---- Página de ajustes: modelos LLM ----
+
+OPCIONES_PROVEEDOR = [(info["etiqueta"], clave) for clave, info in PROVEEDORES_LLM.items()]
+
+
+def cargar_valores_modelos_llm():
+    config = cargar_configuracion_llms()
+    simple = config["simple"]
+    complejo = config["complejo"]
+    return (
+        simple.get("proveedor", "ollama"),
+        simple.get("modelo", ""),
+        simple.get("temperature", 0.1),
+        complejo.get("proveedor", "google_genai"),
+        complejo.get("modelo", ""),
+        complejo.get("temperature", 0.3),
+    )
+
+
+def guardar_modelos_llm(proveedor_simple, modelo_simple, temp_simple, proveedor_complejo, modelo_complejo, temp_complejo):
+    config = {
+        "simple": {"proveedor": proveedor_simple, "modelo": modelo_simple.strip(), "temperature": temp_simple},
+        "complejo": {"proveedor": proveedor_complejo, "modelo": modelo_complejo.strip(), "temperature": temp_complejo},
+    }
+    guardar_configuracion_llms(config)
+    return (
+        "✅ Configuración de modelos guardada en `src/llm_config.json`. "
+        "Si esta sesión ya había ejecutado el agente, reinicia la aplicación "
+        "(`python src/gui.py`) para que los nuevos modelos se apliquen."
     )
 
 
@@ -244,9 +279,36 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
             eliminar_pdfs_btn = gr.Button("🗑️ Eliminar seleccionados")
         estado_pdfs_txt = gr.Markdown("")
 
+        gr.Markdown("### 🧠 Modelos LLM")
+        gr.Markdown(
+            "El agente usa 2 modelos: uno para tareas **simples** (extracción, evaluación, "
+            "párrafos cortos) y otro para tareas **complejas** (propuesta de categorías, "
+            "redacción del cuerpo, generación de la tabla y ensamblado final). Cada uno puede "
+            "ser un modelo local de Ollama o un servicio externo mediante API key — pueden ser "
+            "iguales o distintos. Si eliges un proveedor de tipo API, recuerda rellenar su clave "
+            "en la sección de variables de entorno de abajo."
+        )
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("**Modelo para tareas simples**")
+                proveedor_simple_dd = gr.Dropdown(
+                    label="Proveedor", choices=OPCIONES_PROVEEDOR, value="ollama"
+                )
+                modelo_simple_txt = gr.Textbox(label="Nombre del modelo", placeholder="ej: llama3.2:3b")
+                temp_simple_sl = gr.Slider(label="Temperature", minimum=0.0, maximum=1.0, step=0.05, value=0.1)
+            with gr.Column():
+                gr.Markdown("**Modelo para tareas complejas**")
+                proveedor_complejo_dd = gr.Dropdown(
+                    label="Proveedor", choices=OPCIONES_PROVEEDOR, value="google_genai"
+                )
+                modelo_complejo_txt = gr.Textbox(label="Nombre del modelo", placeholder="ej: gemini-2.5-flash")
+                temp_complejo_sl = gr.Slider(label="Temperature", minimum=0.0, maximum=1.0, step=0.05, value=0.3)
+        guardar_modelos_btn = gr.Button("💾 Guardar modelos LLM", variant="primary")
+        estado_modelos_txt = gr.Markdown("")
+
         gr.Markdown("### 🔑 Variables de entorno (`src/.env`)")
         gr.Markdown(
-            "Las claves necesarias están definidas en `src/.env.example`. "
+            "Claves de API necesarias según los proveedores elegidos arriba. "
             "Si `src/.env` todavía no existe, se creará al guardar."
         )
         env_textboxes = {}
@@ -287,6 +349,12 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
         fn=refrescar_lista_pdfs, outputs=[lista_pdfs]
     ).then(
         fn=cargar_valores_env, outputs=list(env_textboxes.values())
+    ).then(
+        fn=cargar_valores_modelos_llm,
+        outputs=[
+            proveedor_simple_dd, modelo_simple_txt, temp_simple_sl,
+            proveedor_complejo_dd, modelo_complejo_txt, temp_complejo_sl,
+        ],
     )
 
     volver_btn.click(fn=mostrar_inicio, outputs=[pagina_inicio, pagina_ajustes, pagina_chat])
@@ -295,6 +363,14 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
     subir_pdfs.upload(fn=anadir_pdfs, inputs=[subir_pdfs], outputs=[lista_pdfs, estado_pdfs_txt, subir_pdfs])
     eliminar_pdfs_btn.click(fn=eliminar_pdfs, inputs=[lista_pdfs], outputs=[lista_pdfs, estado_pdfs_txt])
     guardar_env_btn.click(fn=guardar_env, inputs=list(env_textboxes.values()), outputs=[estado_env_txt])
+    guardar_modelos_btn.click(
+        fn=guardar_modelos_llm,
+        inputs=[
+            proveedor_simple_dd, modelo_simple_txt, temp_simple_sl,
+            proveedor_complejo_dd, modelo_complejo_txt, temp_complejo_sl,
+        ],
+        outputs=[estado_modelos_txt],
+    )
 
     # ---- Cableado del chat ----
     enviar_btn.click(
