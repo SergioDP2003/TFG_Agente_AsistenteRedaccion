@@ -368,7 +368,11 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
 
     # ---- Página de la conversación ----
     with gr.Column(visible=False) as pagina_chat:
-        chatbot = gr.Chatbot(height=600, label="Conversación")
+        chatbot = gr.Chatbot(
+            height=600,
+            label="Conversación",
+            group_consecutive_messages=False,
+        )
         config_state = gr.State(None)
 
         with gr.Row():

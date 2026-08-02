@@ -1189,60 +1189,34 @@ def redactar_trabajos_relacionados_node(state: AgentState) -> AgentState:
 def recomendar_tabla_node(state: AgentState):
 
     prompt = f"""
-    Eres un agente experto y revisor de revistas científicas indexadas. 
-    A partir de los datos provistos, debes realizar una recomendación formal sobre si es metodológicamente 
-    necesario o enriquecedor incluir una tabla comparativa (matriz de características) al final de la sección 
-    "Related Works" para contrastar la propuesta del autor con la literatura analizada.
-
     Ficha técnica de nuestro Paper:
     {state["tema_paper"]}
 
     Trabajos Relacionados Analizados:
     {json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
 
-    Categorías Taxonómicas:
+    Categorías Taxonómicas (si existen):
     {json.dumps(state.get("categorias_propuestas", {}), indent=2, ensure_ascii=False)}
 
-    FORMATO REQUERIDO OBLIGATORIO:
-    Recomendación: [Escribe SÍ o NO]
-    Justificación: [Escribe una justificación científica, breve y con razones de peso]
+    Evalúa si es metodológicamente recomendable incluir, al final de la sección "Related Works",
+    una tabla comparativa (matriz de características) que contraste la propuesta del autor con
+    la literatura analizada.
+
+    Responde con Sí o No junto con una breve explicación del por qué. La explicación de máximo 1 párrafo de 50 palabras.
     """
 
-    res = llm_simple.invoke(prompt)
+    response = llm_simple.invoke(prompt)
 
-    contenido_recomendacion = res.content.strip()
-
-    # --- PARSING ESTRATÉGICO PARA DISEÑO VISUAL ---
-    # Detectamos si el LLM recomienda un SÍ o un NO de manera robusta
-    es_si = "recomendación: sí" in contenido_recomendacion.lower() or "recomendación: si" in contenido_recomendacion.lower()
-    
-    # Limpiamos las etiquetas repetitivas del texto para formatearlo nosotros de forma más bella
-    justificacion_limpia = contenido_recomendacion
-    if "justificación:" in contenido_recomendacion.lower():
-        justificacion_limpia = contenido_recomendacion.lower().split("justificación:")[1].strip()
-    elif "justificacion:" in contenido_recomendacion.lower():
-         justificacion_limpia = contenido_recomendacion.lower().split("justificacion:")[1].strip()
-
-    # --- REPORTE CONVERSACIONAL DE ALTA CALIDAD ---
-    lineas_mensaje = []
-    if es_si:
-        lineas_mensaje.append("Recomendación de estructura: Se recomienda la inclusión de una Tabla Comparativa.")
-    else:
-        lineas_mensaje.append("Recomendación de estructura: No se considera crítica una Tabla Comparativa.")
-        
-    lineas_mensaje.append(f"\nJustificación: {justificacion_limpia.capitalize()}")
-
-    mensaje_final = "\n".join(lineas_mensaje)
-
-    mensaje_final2 = f"¿Deseas incluir la tabla comparativa? (s/n):"
+    mensaje_salida = (
+        f"¿Te recomiendo incluir una tabla comparativa?\n"
+        f"{response.content}\n"
+        f"¿Cuál es tu decisión? (s/n)\n"
+    )
 
     return {
-        "recomendacion_tabla": contenido_recomendacion,
+        "recomendacion_tabla": response.content.strip(),
         "error": None,
-        "messages": [
-            AIMessage(content=mensaje_final),
-            AIMessage(content=mensaje_final2)
-        ]
+        "messages": [AIMessage(content=mensaje_salida)]
     }
 
 def decision_tabla_node(state: AgentState):
