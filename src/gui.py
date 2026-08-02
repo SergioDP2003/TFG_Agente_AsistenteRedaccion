@@ -26,7 +26,7 @@ from langgraph.types import Command
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 RUTA_ENV = os.path.join(_SRC_DIR, ".env")
-CARPETA_PDFS = "trabajos_relacionados"
+CARPETA_PDFS = os.path.join(os.path.dirname(_SRC_DIR), "trabajos_relacionados")
 
 # Cargamos el .env real (si existe) antes de importar app1, para que
 # `crear_llm`/`LLMPerezoso` puedan resolver las API keys en su primer uso real.
@@ -45,6 +45,7 @@ from app1 import (  # noqa: E402
     PROVEEDORES_LLM,
     cargar_configuracion_llms,
     guardar_configuracion_llms,
+    LIMITE_CARACTERES_ANALISIS_DEFECTO,
 )
 
 CLAVES_ENV = sorted({info["api_key_env"] for info in PROVEEDORES_LLM.values() if info["api_key_env"]})
@@ -114,14 +115,33 @@ def ejecutar_hasta_pausa(entrada, config):
     yield historial, True
 
 
-def iniciar_conversacion():
+def comenzar_y_iniciar():
+    """
+    Combina en un único evento encadenado el cambio de página y el arranque del grafo.
+
+    Antes eran 2 eventos separados (`.click(mostrar_chat).then(iniciar_conversacion)`):
+    tras navegar primero a Ajustes (cuyo botón dispara una cadena de 4 pasos encadenados)
+    y volver al inicio, el segundo paso de esta cadena (el que realmente arranca el grafo)
+    se quedaba colgado en la cola de eventos de Gradio y nunca llegaba a ejecutarse, aunque
+    el primer paso (mostrar la página de chat) sí se aplicaba. Fusionar ambos pasos en un
+    único evento evita por completo esa interacción entre colas encadenadas.
+    """
+    yield (
+        gr.update(visible=False), gr.update(visible=False), gr.update(visible=True),
+        gr.update(), gr.update(), gr.update(),
+    )
+
     config = nueva_configuracion()
     terminado = False
     for historial, terminado in ejecutar_hasta_pausa(crear_estado_inicial(), config):
-        yield historial, config, gr.update()
-    yield historial, config, gr.update(
-        interactive=not terminado,
-        placeholder="Proceso finalizado." if terminado else "Escribe aquí tu respuesta...",
+        yield gr.update(), gr.update(), gr.update(), historial, config, gr.update()
+    yield (
+        gr.update(), gr.update(), gr.update(),
+        historial, config,
+        gr.update(
+            interactive=not terminado,
+            placeholder="Proceso finalizado." if terminado else "Escribe aquí tu respuesta...",
+        ),
     )
 
 
@@ -221,13 +241,19 @@ def cargar_valores_modelos_llm():
         complejo.get("proveedor", "google_genai"),
         complejo.get("modelo", ""),
         complejo.get("temperature", 0.3),
+        config.get("limite_caracteres_analisis", LIMITE_CARACTERES_ANALISIS_DEFECTO),
     )
 
 
-def guardar_modelos_llm(proveedor_simple, modelo_simple, temp_simple, proveedor_complejo, modelo_complejo, temp_complejo):
+def guardar_modelos_llm(
+    proveedor_simple, modelo_simple, temp_simple,
+    proveedor_complejo, modelo_complejo, temp_complejo,
+    limite_caracteres_analisis,
+):
     config = {
         "simple": {"proveedor": proveedor_simple, "modelo": modelo_simple.strip(), "temperature": temp_simple},
         "complejo": {"proveedor": proveedor_complejo, "modelo": modelo_complejo.strip(), "temperature": temp_complejo},
+        "limite_caracteres_analisis": int(limite_caracteres_analisis),
     }
     guardar_configuracion_llms(config)
     return (
@@ -239,16 +265,21 @@ def guardar_modelos_llm(proveedor_simple, modelo_simple, temp_simple, proveedor_
 
 # ---- Navegación entre páginas ----
 
-def mostrar_inicio():
-    return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+def mostrar_ajustes_y_cargar():
+    """
+    Combina en un único evento el cambio de página y la carga de todos los valores de
+    Ajustes (PDFs, variables de entorno y modelos LLM).
 
-
-def mostrar_ajustes():
-    return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
-
-
-def mostrar_chat():
-    return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)
+    Antes eran 4 pasos encadenados con `.then()`; una cadena tan larga podía dejar la
+    cola de eventos de Gradio en un estado que bloqueaba el siguiente evento encadenado
+    de otro botón (ver `comenzar_y_iniciar`), así que se fusiona todo en un único evento.
+    """
+    return (
+        gr.update(visible=False), gr.update(visible=True), gr.update(visible=False),
+        refrescar_lista_pdfs(),
+        *cargar_valores_env(),
+        *cargar_valores_modelos_llm(),
+    )
 
 
 with gr.Blocks(title="AI Related Works Agent") as demo:
@@ -303,6 +334,18 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
                 )
                 modelo_complejo_txt = gr.Textbox(label="Nombre del modelo", placeholder="ej: gemini-2.5-flash")
                 temp_complejo_sl = gr.Slider(label="Temperature", minimum=0.0, maximum=1.0, step=0.05, value=0.3)
+        limite_caracteres_num = gr.Number(
+            label="Caracteres de cada PDF enviados al modelo simple al analizar los trabajos",
+            info=(
+                "Cuanto más grande sea la ventana de contexto del modelo simple, más alto puedes "
+                "poner este valor. Pon 0 para enviar el texto completo de cada PDF sin recortar "
+                "(recomendable solo con modelos de ventana de contexto muy grande)."
+            ),
+            minimum=0,
+            step=1000,
+            precision=0,
+            value=LIMITE_CARACTERES_ANALISIS_DEFECTO,
+        )
         guardar_modelos_btn = gr.Button("💾 Guardar modelos LLM", variant="primary")
         estado_modelos_txt = gr.Markdown("")
 
@@ -338,26 +381,30 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
 
     # ---- Cableado de navegación ----
     comenzar_btn.click(
-        fn=mostrar_chat, outputs=[pagina_inicio, pagina_ajustes, pagina_chat]
-    ).then(
-        fn=iniciar_conversacion, outputs=[chatbot, config_state, entrada_txt]
+        fn=comenzar_y_iniciar,
+        outputs=[pagina_inicio, pagina_ajustes, pagina_chat, chatbot, config_state, entrada_txt],
     )
 
     ajustes_btn.click(
-        fn=mostrar_ajustes, outputs=[pagina_inicio, pagina_ajustes, pagina_chat]
-    ).then(
-        fn=refrescar_lista_pdfs, outputs=[lista_pdfs]
-    ).then(
-        fn=cargar_valores_env, outputs=list(env_textboxes.values())
-    ).then(
-        fn=cargar_valores_modelos_llm,
+        fn=mostrar_ajustes_y_cargar,
         outputs=[
+            pagina_inicio, pagina_ajustes, pagina_chat,
+            lista_pdfs,
+            *env_textboxes.values(),
             proveedor_simple_dd, modelo_simple_txt, temp_simple_sl,
             proveedor_complejo_dd, modelo_complejo_txt, temp_complejo_sl,
+            limite_caracteres_num,
         ],
     )
 
-    volver_btn.click(fn=mostrar_inicio, outputs=[pagina_inicio, pagina_ajustes, pagina_chat])
+    # "Volver al inicio" fuerza una recarga completa de la página (en vez de solo
+    # alternar la visibilidad de las columnas): tras visitar Ajustes, la cola interna
+    # de eventos de Gradio queda en un estado en el que el evento de "Comenzar" deja
+    # de ejecutarse (aunque se siga aceptando y devuelva un event_id), sin ningún error
+    # visible ni en el servidor ni en la consola del navegador. Como en este punto el
+    # usuario todavía no ha arrancado ninguna conversación, recargar la página es
+    # inofensivo y garantiza una sesión (session_hash) y una cola completamente nuevas.
+    volver_btn.click(js="() => { window.location.reload(); }")
 
     # ---- Cableado de ajustes ----
     subir_pdfs.upload(fn=anadir_pdfs, inputs=[subir_pdfs], outputs=[lista_pdfs, estado_pdfs_txt, subir_pdfs])
@@ -368,6 +415,7 @@ with gr.Blocks(title="AI Related Works Agent") as demo:
         inputs=[
             proveedor_simple_dd, modelo_simple_txt, temp_simple_sl,
             proveedor_complejo_dd, modelo_complejo_txt, temp_complejo_sl,
+            limite_caracteres_num,
         ],
         outputs=[estado_modelos_txt],
     )

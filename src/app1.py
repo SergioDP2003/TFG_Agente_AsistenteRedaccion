@@ -31,7 +31,9 @@ load_dotenv()
 # siempre que el paquete langchain-<proveedor> correspondiente esté instalado.
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SRC_DIR)
 RUTA_LLM_CONFIG = os.path.join(_SRC_DIR, "llm_config.json")
+CARPETA_PDFS = os.path.join(_REPO_ROOT, "trabajos_relacionados")
 
 PROVEEDORES_LLM = {
     "ollama": {
@@ -63,6 +65,12 @@ CONFIG_LLM_DEFECTO = {
     "complejo": {"proveedor": "google_genai", "modelo": "gemini-2.5-flash", "temperature": 0.3},
 }
 
+# Nº máximo de caracteres de cada PDF que `analizar_trabajos_node` envía al LLM "simple"
+# (ver más abajo). 0 o negativo = sin límite: se envía el texto completo de cada PDF, tal
+# cual, sin importar lo corto o largo que sea (el slicing de Python no falla si el texto es
+# más corto que el límite, así que no hay caso especial que romperse con PDFs pequeños).
+LIMITE_CARACTERES_ANALISIS_DEFECTO = 12000
+
 
 def cargar_configuracion_llms() -> dict:
     """Lee src/llm_config.json (creado/editado desde la página de Ajustes de la GUI).
@@ -74,10 +82,16 @@ def cargar_configuracion_llms() -> dict:
             return {
                 "simple": {**CONFIG_LLM_DEFECTO["simple"], **datos.get("simple", {})},
                 "complejo": {**CONFIG_LLM_DEFECTO["complejo"], **datos.get("complejo", {})},
+                "limite_caracteres_analisis": datos.get(
+                    "limite_caracteres_analisis", LIMITE_CARACTERES_ANALISIS_DEFECTO
+                ),
             }
         except (json.JSONDecodeError, OSError):
             pass
-    return {slot: dict(cfg) for slot, cfg in CONFIG_LLM_DEFECTO.items()}
+    return {
+        **{slot: dict(cfg) for slot, cfg in CONFIG_LLM_DEFECTO.items()},
+        "limite_caracteres_analisis": LIMITE_CARACTERES_ANALISIS_DEFECTO,
+    }
 
 
 def guardar_configuracion_llms(config: dict):
@@ -377,7 +391,7 @@ def definir_tematica_node(state: AgentState) -> AgentState:
         }
 
 def buscar_pdfs_node(state: AgentState):
-    carpeta = "trabajos_relacionados"
+    carpeta = CARPETA_PDFS
     if not os.path.exists(carpeta):
         os.makedirs(carpeta)
         mensaje_error = (
@@ -471,10 +485,19 @@ def analizar_trabajos_node(state: AgentState):
     reporte_titulos = []
     
     structured_llm = llm_simple.with_structured_output(PaperEstructurado)
-    
+
+    # Configurable desde Ajustes: cuántos caracteres de cada PDF se envían al LLM simple.
+    # 0 o negativo = sin límite (texto completo del PDF, para modelos con ventana de
+    # contexto muy grande). El slicing `texto[:limite]` no falla si `texto` es más corto
+    # que `limite` — simplemente devuelve el texto completo, así que un PDF con poco
+    # contenido nunca rompe esto aunque el límite configurado sea enorme.
+    limite_caracteres = cargar_configuracion_llms().get(
+        "limite_caracteres_analisis", LIMITE_CARACTERES_ANALISIS_DEFECTO
+    )
+
     for i, texto in enumerate(state["textos_trabajos"]):
-        fragmento = texto[:12000]
-        
+        fragmento = texto if limite_caracteres <= 0 else texto[:limite_caracteres]
+
         print(f"🔄 Extrayendo datos únicos del trabajo {i+1}...")
         
         prompt = f"""
@@ -619,23 +642,58 @@ def gateway_categorizacion(state: AgentState) -> str:
 def proponer_categorias_node(state: AgentState) -> AgentState:
     trabajos = state.get("trabajos_analizados", [])
     tema = state.get("tema_paper", "")
-    mensajes_previos = state.get("messages", [])
-    
+
     titulos_reales = [t["titulo"] for t in trabajos]
-    es_reintento = any("solicita generar nuevas categorías" in m.content for m in mensajes_previos if isinstance(m, HumanMessage))
+
+    # Es un reintento (opción [2] "Pedir nuevas categorías" del menú de confirmación) si ya
+    # había una propuesta previa en el estado — se detecta directamente sobre el dato, no
+    # buscando texto en el historial de mensajes (frágil: dependía de que el texto exacto de
+    # la opción 2 del menú no cambiara nunca).
+    propuesta_previa = state.get("categorias_propuestas") or {}
+    categorias_previas = propuesta_previa.get("categorias", []) if isinstance(propuesta_previa, dict) else []
+    es_reintento = bool(categorias_previas)
+
+    # Fichas técnicas completas (problema, metodología, aportaciones, limitaciones...), no solo
+    # los títulos: para que la propuesta sea de verdad "de alto nivel" tiene que fundamentarse en
+    # el contenido real de cada trabajo, igual que ya hace `evaluar_categorizacion_node`.
+    fichas_trabajos = json.dumps(trabajos, indent=2, ensure_ascii=False)
+
+    bloque_reintento = ""
+    if es_reintento:
+        resumen_previo = "\n".join(
+            f"- \"{cat['nombre']}\" ({len(cat.get('trabajos', []))} trabajos): {cat['descripcion']}"
+            for cat in categorias_previas
+        )
+        bloque_reintento = f"""
+    PROPUESTA ANTERIOR (el usuario la ha rechazado y pide una propuesta nueva y mejor):
+    {resumen_previo}
+
+    Antes de proponer, evalúa CRÍTICAMENTE esa propuesta anterior a partir del recuento de trabajos
+    de cada categoría: ¿hay categorías con muy pocos trabajos frente a otras sobrecargadas?
+    ¿son demasiado amplias, demasiado estrechas, o se solapan entre sí? ¿reflejan bien el problema y
+    la metodología real de los trabajos o son superficiales? Genera una propuesta NUEVA y REALMENTE
+    DISTINTA que corrija esos problemas: no repitas los mismos nombres de categoría ni el mismo
+    criterio de división (si antes fue por temática, prueba por metodología, tipo de arquitectura,
+    dominio de aplicación u otro eje relevante — y viceversa).
+    """
 
     prompt = f"""
     Eres un editor de revistas científicas. Clasifica estos trabajos para la sección 'Related Works'.
-    
-    TRABAJOS: {titulos_reales}
 
-    TEMA: {tema}
+    Analiza en profundidad la ficha técnica de cada trabajo (problema específico, metodología,
+    aportaciones y limitaciones) para fundamentar la categorización en su contenido real, no solo
+    en el título.
 
+    FICHAS TÉCNICAS DE LOS TRABAJOS:
+    {fichas_trabajos}
+
+    TEMA DEL PAPER DEL USUARIO: {tema}
+    {bloque_reintento}
     ESTILO REQUERIDO:
-    1. NOMBRE CATEGORÍA: Máximo 5 palabras. Debe ser un concepto técnico (ej. 'Agentes Autónomos', 'Sistemas Multi-Agente', 'Arquitecturas LLM').
+    1. NOMBRE CATEGORÍA: Máximo 5 palabras. Debe ser un concepto técnico de alto nivel (ej. 'Agentes Autónomos', 'Sistemas Multi-Agente', 'Arquitecturas LLM').
     2. NO uses frases como "Investigación sobre..." o "El trabajo de...".
-    3. DESCRIPCIÓN: Una sola frase técnica y directa que describa la categoría.
-    4. ENFOQUE: {'Busca una división por METODOLOGÍA' if es_reintento else 'Busca una división por TEMÁTICA'}.
+    3. DESCRIPCIÓN: Una sola frase técnica y directa que describa la categoría, justificada por el contenido real de los trabajos que agrupa.
+    4. En el campo "trabajos" de cada categoría, usa EXACTAMENTE el título de cada trabajo tal y como aparece en las fichas técnicas.
     """
 
     try:
@@ -649,9 +707,9 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
         for cat in propuesta_dict['categorias']:
             nombre_limpio = " ".join(cat['nombre'].split()[:5]).title()
             nombre_limpio = nombre_limpio.rstrip(".")
-            
+
             validos = [t for t in cat['trabajos'] if t in titulos_reales and t not in asignados]
-            
+
             if validos:
                 categorias_finales.append({
                     "nombre": nombre_limpio,
@@ -664,9 +722,15 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
         if faltantes and categorias_finales:
             categorias_finales[0]['trabajos'].extend(faltantes)
 
-        enfoque_str = "METODOLÓGICO" if es_reintento else "TEMÁTICO"
+        cabecera = (
+            "He evaluado la propuesta anterior (equilibrio entre categorías, solapamientos y "
+            "profundidad de la división) y diseñado una propuesta **alternativa y mejorada**.\n"
+            if es_reintento else
+            "He analizado en detalle el contenido de cada trabajo (problema, metodología y "
+            "aportaciones) para diseñar una propuesta de categorías de alto nivel.\n"
+        )
         lineas_propuesta = [
-            f"He diseñado una propuesta de categorías bajo un enfoque **{enfoque_str}**.\n"
+            f"{cabecera}"
             f"A continuación se muestran las categorías propuestas:\n"
         ]
 
@@ -1239,36 +1303,67 @@ def proponer_estructura_node(state: AgentState):
 
     estructura_anterior = state.get("estructura_tabla_propuesta")
 
-    prompt = f"""
-Eres un investigador experto diseñando tablas comparativas.
+    bloque_reintento = ""
+    if estructura_anterior:
+        columnas_anteriores = ", ".join(f'"{c}"' for c in estructura_anterior.get("columnas", []))
+        justificacion_anterior = estructura_anterior.get("justificacion", "")
+        bloque_reintento = f"""
+PROPUESTA ANTERIOR (el usuario la ha rechazado y pide una estructura nueva y mejor):
+Columnas: {columnas_anteriores}
+Justificación dada en su momento: {justificacion_anterior}
 
-Tu objetivo es generar una NUEVA estructura que aporte una perspectiva diferente.
+Antes de proponer, evalúa CRÍTICAMENTE esa propuesta anterior a la luz de los trabajos analizados:
+¿qué columnas eran poco diferenciadoras (casi todos los trabajos comparten el mismo valor, o no hay
+evidencia suficiente en las fichas para rellenarlas con confianza)? ¿alguna columna binaria debería
+haber sido descriptiva por perder matices relevantes al reducirla a Sí/No (o al revés, una
+descriptiva que en realidad es un hecho verificable y ganaría claridad como binaria)? ¿faltaba algún
+criterio relevante para este tema concreto? Diseña una estructura NUEVA que sustituya
+específicamente esas columnas débiles por otras mejor fundamentadas — no te limites a cambiar
+nombres o reordenar; el conjunto de columnas debe representar una perspectiva de comparación
+realmente distinta y más útil que la anterior.
+"""
+
+    prompt = f"""
+Eres un investigador experto diseñando la matriz de comparación (tabla comparativa de características) de la sección "Related Works" de un paper científico, al estilo de las tablas comparativas de survey papers de referencia en el área: una tabla que permite ver de un vistazo qué capacidades técnicas concretas cubre cada trabajo y en cuáles difiere del resto.
 
 CONTEXTO:
-Tema:
+Tema y ficha técnica de nuestro trabajo:
 {state["tema_paper"]}
 
-Trabajos:
+Trabajos analizados (problema que abordan, metodología, aportaciones, limitaciones y casos de uso):
 {json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
-
-Estructura anterior:
-{json.dumps(estructura_anterior, indent=2, ensure_ascii=False) if estructura_anterior else "Ninguna"}
-
+{bloque_reintento}
 TAREA:
 
-Genera una NUEVA estructura de tabla comparativa.
+Diseña la tabla comparativa que mejor sirva para diferenciar a ESTOS trabajos concretos. Por cada
+criterio de comparación que consideres relevante, decide de forma razonada a qué tipo de columna
+pertenece:
 
-OBLIGATORIO SI EXISTE ESTRUCTURA ANTERIOR:
+1. COLUMNA DESCRIPTIVA: propiedad cualitativa expresable en una frase corta que perdería
+   información relevante si se redujera a un sí/no — p. ej. ámbito/dominio de aplicación, objetivo o
+   problema que resuelve, nivel de abstracción, componentes o elementos principales que modela, tipo
+   de enfoque o metodología. Elígelas específicas para el TEMA CONCRETO de estos trabajos, no una
+   lista genérica de metadatos.
 
-- NO reutilizar más del 50% de las columnas anteriores
-- Cambiar el enfoque de comparación
+2. COLUMNA DE CAPACIDAD BINARIA: criterio técnico concreto y verificable que cada trabajo cumple o
+   no cumple, nombrado como una capacidad afirmable (p. ej. "Modelado de Edge", "Soporte de Big
+   Data", "Generación automática de código", "Evaluación empírica"), de forma que la celda se pueda
+   responder inequívocamente con Sí/No. Identifícalas analizando qué capacidades técnicas concretas
+   aparecen mencionadas —o notoriamente ausentes— de forma recurrente en la metodología,
+   aportaciones, limitaciones o casos de uso de VARIOS de los trabajos analizados. Deben ser
+   criterios reales y diferenciadores entre los trabajos (evita capacidades que cumplan todos los
+   trabajos por igual o que ninguno cumpla: si un criterio no distingue a los trabajos entre sí,
+   descártalo o replantéalo como columna descriptiva en vez de forzarlo a binario). El NOMBRE de cada
+   columna de capacidad debe describir la capacidad en sí (nunca formularse como pregunta ni como
+   etiqueta ambigua), porque ese nombre es lo único que se usará después para saber cómo rellenar
+   cada celda.
 
-CAMBIO DE ENFOQUE (elige uno distinto al anterior):
-- técnico (arquitectura, modelo, sistema)
-- evaluativo (métricas, rendimiento)
-- crítico (limitaciones, problemas)
-- aplicación (casos de uso, dominios)
-- comparativo (ventajas vs desventajas)
+NO hay una proporción fija entre columnas descriptivas y binarias: decide la mezcla que haga la
+comparación más fructífera para ESTOS trabajos concretos, no una plantilla genérica. Si para este
+conjunto de trabajos apenas hay capacidades verificables que realmente los distingan entre sí, usa
+mayoritaria o exclusivamente columnas descriptivas; si en cambio hay varias capacidades concretas
+que sí los diferencian con claridad, prioriza columnas binarias. Justifica esa elección de mezcla
+explícitamente en la justificación final.
 
 FORMATO:
 
@@ -1281,11 +1376,10 @@ FORMATO:
 REGLAS:
 
 - SOLO JSON
-- Trata de no incluir muchos campos del JSON de trabajos_analizados como columnas (salvo el campo título)
-- 5-8 columnas
-- incluir "Título"
-- columnas deben ser diferentes a las anteriores
-- justificación obligatoria (mínimo 4 líneas)
+- NO copies literalmente los nombres de los campos del JSON de trabajos_analizados (p. ej. "Autores", "Año", "Metodología detallada") como columnas; deriva criterios de comparación propios
+- 6-10 columnas en total, incluyendo "Título" (siempre la primera)
+- Las columnas deben ser distintas a las de la propuesta anterior (si existe)
+- justificación obligatoria (mínimo 4 líneas): explica cada columna elegida, por qué es descriptiva o binaria, y por qué es relevante para diferenciar estos trabajos concretos; si hubo propuesta anterior, explica también qué le faltaba o le sobraba y cómo la corrige esta nueva propuesta
 
 Si repites estructura → RESPUESTA INVÁLIDA
 Si no puedes → null
@@ -1311,7 +1405,7 @@ Si no puedes → null
                 f" Justificación metodológica: {nueva.get('justificacion')}\n",
                 " ¿Qué deseas hacer con este diseño de tabla?",
                 "  [1] - Aceptar estructura y rellenar los datos automáticamente.",
-                "  [2] - Pedir una nueva estructura (forzará un enfoque analítico alternativo).",
+                "  [2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
                 "  [3] - Modificar o añadir columnas de forma personalizada.",
                 "  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
             ]
@@ -1457,7 +1551,7 @@ Si no puedes generar JSON válido → devuelve null
     mensaje_final = (
         f" ¿Qué deseas hacer con este diseño de tabla?",
             f"  [1] - Aceptar estructura y rellenar los datos automáticamente.",
-            f"  [2] - Pedir una nueva estructura (forzará un enfoque analítico alternativo).",
+            f"  [2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
             f"  [3] - Modificar o añadir columnas de forma personalizada.",
             f"  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
     )
@@ -1492,7 +1586,7 @@ def gateway_estructura(state: AgentState):
 def generar_tabla_node(state: AgentState):
 
     prompt = f"""
-Eres un investigador redactando una tabla comparativa para un paper científico.
+Eres un investigador rellenando la tabla comparativa de la sección "Related Works" de un paper científico, siguiendo exactamente la estructura de columnas ya acordada.
 
 CONTEXTO:
 
@@ -1502,47 +1596,46 @@ Trabajo Propio:
 Trabajos analizados:
 {json.dumps(state["trabajos_analizados"], indent=2, ensure_ascii=False)}
 
-Estructura de la tabla:
+Estructura de la tabla (columnas ya acordadas, en este orden):
 {json.dumps(state["estructura_tabla_propuesta"], indent=2, ensure_ascii=False)}
 
 TAREA:
 
-Generar una tabla comparativa en formato Markdown con todos los papers realcionados y el trabajo propio.
+Generar la tabla comparativa completa en formato Markdown: una FILA por cada trabajo analizado (y, si "incluye_trabajo_propio" es true, una fila final para el trabajo propio), con exactamente las columnas de la estructura y en ese mismo orden.
 
-FORMATO:
+PASO PREVIO OBLIGATORIO — clasifica internamente cada columna antes de rellenar (no muestres esta clasificación en la salida):
+- COLUMNA BINARIA: su nombre describe una capacidad, funcionalidad o característica afirmable que un trabajo tiene o no tiene (p. ej. "Modelado de Edge", "Soporte de Big Data", "Generación de código", "Evaluación empírica", "Código abierto").
+- COLUMNA DESCRIPTIVA: el resto de columnas (ámbito, objetivo, nivel de abstracción, componentes, metodología, etc.).
+- "Título" es siempre la columna de identificación: nunca se trata como binaria ni se deja vacía.
 
-- Cada FILA = un paper
-- Columnas según la estructura definida
+REGLAS CRÍTICAS PARA COLUMNAS BINARIAS (OBLIGATORIAS):
+- El valor debe ser EXACTAMENTE "Sí" o "No" (nunca "Parcial", "No especificado", "N/A" ni ninguna explicación adicional)
+- Marca "Sí" solo si hay evidencia explícita o claramente inferible en problema_especifico/metodologia_detallada/aportaciones_clave/casos_uso de que el trabajo cubre esa capacidad
+- Si no hay evidencia de que el trabajo la cubra, marca "No" (la ausencia de mención se interpreta como que no la soporta); nunca dejar la celda ambigua o vacía
+- Aplica el mismo criterio de evaluación por igual a todos los trabajos, incluido el trabajo propio (no lo favorezcas sistemáticamente sin evidencia)
 
-REGLAS CRÍTICAS (OBLIGATORIAS):
+REGLAS CRÍTICAS PARA COLUMNAS DESCRIPTIVAS (OBLIGATORIAS):
+- Solo palabras clave o frases cortas, separadas por comas
+- Máximo 8-12 palabras por celda
+- NO escribir frases largas ni texto narrativo
+- Si no hay información → escribir "No especificado" (PROHIBIDO dejar la celda vacía)
 
-1. TODAS las celdas deben estar rellenas
-   - Si no hay información → escribir: "No especificado"
-   - PROHIBIDO dejar celdas vacías
+REGLAS GENERALES:
+- NO incluir categorías temáticas en ninguna celda
+- NO añadir columnas extra ni omitir ninguna de la estructura
+- SALIDA: SOLO la tabla en Markdown (cabecera + fila separadora + filas de datos), sin texto antes o después, sin explicaciones ni comentarios
 
-2. ESTILO DE CONTENIDO:
-   - Solo palabras clave o frases cortas
-   - Separadas por comas
-   - Máximo 8-12 palabras por celda
-   - NO escribir frases largas
-   - NO texto narrativo
-
-3. CONTENIDO:
-   - NO incluir categorías en ninguna celda
-   - NO añadir columnas extra
-   - Respetar exactamente la estructura dada
-
-4. SALIDA:
-   - SOLO la tabla en Markdown
-   - NO añadir texto antes o después
-   - NO explicaciones
-   - NO comentarios
-
-EJEMPLO DE CELDA CORRECTA:
+EJEMPLO DE CELDA DESCRIPTIVA CORRECTA:
 "Edge computing, baja latencia, movilidad"
 
-EJEMPLO DE CELDA INCORRECTA:
+EJEMPLO DE CELDA DESCRIPTIVA INCORRECTA:
 "Este trabajo propone una arquitectura que..."
+
+EJEMPLO DE CELDA BINARIA CORRECTA:
+"Sí"  /  "No"
+
+EJEMPLO DE CELDA BINARIA INCORRECTA:
+"Parcialmente, solo en el módulo X"
 
 Si no puedes cumplir TODAS las reglas, la respuesta es inválida.
 """
@@ -1737,6 +1830,240 @@ Solo el párrafo.
         ]
     }
 
+def _limpiar_fences_markdown(texto: str) -> str:
+    """Elimina los delimitadores de bloque de código Markdown (```latex ... ```) que el LLM
+    añade a veces pese a las instrucciones; el fragmento debe poder pegarse tal cual en un
+    documento LaTeX."""
+    texto = re.sub(r'^\s*```(?:latex)?\s*\n', '', texto)
+    texto = re.sub(r'\n\s*```\s*$', '', texto)
+    return texto.strip()
+
+
+def _forzar_parrafo_tras_titulos_categoria(texto: str) -> str:
+    """Obliga a que cada título de categoría (\\noindent\\textbf{...}) sea su propio párrafo,
+    insertando \\par antes y después. Así el primer párrafo de la categoría nunca queda pegado
+    al título, sin depender de que el LLM deje líneas en blanco alrededor."""
+    return re.sub(r'\\noindent\\textbf\{([^}]*)\}', r'\\par\\noindent\\textbf{\1}\\par', texto)
+
+
+def _eliminar_entorno_landscape(texto: str) -> str:
+    """Red de seguridad: la tabla ya no debe rotarse en `landscape` (ahora se reescala con
+    `\\resizebox` en página vertical); si el LLM aun así envuelve la tabla en ese entorno pese a
+    la instrucción, lo eliminamos sin tocar el contenido de la tabla."""
+    for envoltorio in ("\\begin{landscape}", "\\end{landscape}"):
+        texto = texto.replace(envoltorio + "\n", "").replace(envoltorio, "")
+    return texto
+
+
+def _eliminar_longtable(texto: str) -> str:
+    """Red de seguridad: la tabla ya no debe paginarse con `longtable` (ahora es una única
+    tabla reescalada con `\\resizebox`); si el LLM aun así usa `longtable` pese a la
+    instrucción, lo convertimos a `tabular` normal y eliminamos los comandos de cabecera
+    repetida (`\\endfirsthead`, `\\endhead`, etc.) que no son válidos dentro de `tabular`."""
+    if "\\begin{longtable}" not in texto:
+        return texto
+    texto = texto.replace("\\begin{longtable}", "\\begin{tabular}").replace("\\end{longtable}", "\\end{tabular}")
+    for comando in ("\\endfirsthead", "\\endhead", "\\endfoot", "\\endlastfoot"):
+        texto = texto.replace(comando, "")
+    return texto
+
+
+def _forzar_wrap_columnas_tabla(texto: str) -> str:
+    """Red de seguridad: una columna de tipo simple `l`/`c`/`r` (sin ancho fijo) nunca envuelve
+    el texto, así que basta con que su cabecera o alguna celda sea más ancha que el hueco
+    disponible para que el texto se salga visualmente sobre la columna vecina. Convertimos
+    cualquier `l`/`c`/`r` suelto del spec de columnas en un `p{2cm}` con la alineación
+    equivalente (`\\raggedright`/`\\centering`/`\\raggedleft`), dejando intactos los tokens que
+    ya son `p{...}` o llevan un `>{...}` propio."""
+    marcador = "\\begin{tabular}{"
+    inicio = texto.find(marcador)
+    if inicio == -1:
+        return texto
+
+    # El spec de columnas puede contener llaves anidadas (`>{\raggedright\arraybackslash}`,
+    # `p{2cm}`...), así que hay que localizar su `}` de cierre contando profundidad en vez de
+    # cortar en la primera `}` que aparezca (eso truncaría el spec dentro del primer `>{...}`).
+    pos = inicio + len(marcador)
+    profundidad = 1
+    while pos < len(texto) and profundidad > 0:
+        if texto[pos] == '{':
+            profundidad += 1
+        elif texto[pos] == '}':
+            profundidad -= 1
+        pos += 1
+    if profundidad != 0:
+        return texto  # llaves desbalanceadas: no tocamos nada
+
+    fin_spec = pos - 1  # índice del `}` de cierre del spec
+    spec_original = texto[inicio + len(marcador):fin_spec]
+
+    alineacion_a_comando = {"l": "\\raggedright", "c": "\\centering", "r": "\\raggedleft"}
+
+    def reemplazar_token(m):
+        if m.group(1):
+            return m.group(1)  # ya es >{...}/p{...}: no tocar
+        return f">{{{alineacion_a_comando[m.group(2)]}\\arraybackslash}}p{{2cm}}"
+
+    nueva_spec = re.sub(r'(>\{[^}]*\}|p\{[^}]*\})|([lcr])', reemplazar_token, spec_original)
+
+    if nueva_spec == spec_original:
+        return texto
+    return texto[:inicio + len(marcador)] + nueva_spec + texto[fin_spec:]
+
+
+MARCADORES_ORDEN_SECCIONES = [
+    "% SECCION:INTRODUCCION",
+    "% SECCION:CUERPO",
+    "% SECCION:DESCRIPCION_TABLA",
+    "% SECCION:TABLA",
+    "% SECCION:CONCLUSION",
+    "% SECCION:BIBLIOGRAFIA",
+]
+
+
+def _forzar_orden_secciones(texto: str) -> str:
+    """Red de seguridad: el ensamblado final se genera en una única pasada de texto libre y el
+    LLM a veces intercala fragmentos de un bloque dentro de otro (p. ej. deja parte de la
+    descripción de la tabla después de la propia tabla). Le pedimos que marque el inicio de
+    cada bloque con un comentario LaTeX exclusivo (invisible en el PDF) y aquí reconstruimos el
+    documento completo recortando por esos marcadores y reordenando los bloques en el orden
+    correcto, sea cual sea el orden en que el LLM los haya escrito. Si falta algún marcador (el
+    LLM no siguió la instrucción), no tocamos nada y devolvemos el texto tal cual."""
+    posiciones = {}
+    for marcador in MARCADORES_ORDEN_SECCIONES:
+        idx = texto.find(marcador)
+        if idx == -1:
+            return texto
+        posiciones[marcador] = idx
+
+    marcadores_por_posicion = sorted(posiciones.items(), key=lambda par: par[1])
+
+    bloques = {}
+    for i, (marcador, idx) in enumerate(marcadores_por_posicion):
+        fin = marcadores_por_posicion[i + 1][1] if i + 1 < len(marcadores_por_posicion) else len(texto)
+        bloques[marcador] = texto[idx + len(marcador):fin].strip("\n")
+
+    return "\n\n".join(bloques[marcador] for marcador in MARCADORES_ORDEN_SECCIONES)
+
+
+def _ajustar_anchos_columnas_segun_contenido(texto: str) -> str:
+    """Red de seguridad: el LLM asigna el ancho `p{Xcm}` de cada columna "a ojo" y en columnas
+    binarias tiende a guiarse por el contenido corto de las celdas de datos (`Sí`/`No`),
+    ignorando que la cabecera de esa misma columna puede ser mucho más larga (p.ej. "Modelado
+    de Edge"), lo que hace que la cabecera se salga de la columna e invada la columna vecina.
+    Recalculamos el ancho de cada columna a partir de la palabra más larga que aparece en
+    cualquier celda de esa columna (cabecera incluida), ya que una palabra sin espacios es lo
+    único que un `p{}` no puede partir en varias líneas y por tanto lo único que realmente
+    puede desbordarse."""
+    marcador = "\\begin{tabular}{"
+    inicio = texto.find(marcador)
+    fin_tabular = texto.find("\\end{tabular}")
+    if inicio == -1 or fin_tabular == -1 or fin_tabular < inicio:
+        return texto
+
+    # Localizamos el `}` de cierre del spec contando profundidad (puede contener llaves
+    # anidadas, igual que en _forzar_wrap_columnas_tabla).
+    pos = inicio + len(marcador)
+    profundidad = 1
+    while pos < len(texto) and profundidad > 0:
+        if texto[pos] == '{':
+            profundidad += 1
+        elif texto[pos] == '}':
+            profundidad -= 1
+        pos += 1
+    if profundidad != 0:
+        return texto
+
+    fin_spec = pos - 1
+    spec = texto[inicio + len(marcador):fin_spec]
+    cuerpo = texto[pos:fin_tabular]
+
+    tokens = re.findall(r'>\{[^}]*\}p\{[^}]*\}|p\{[^}]*\}|[lcr|]', spec)
+    columnas = [t for t in tokens if t != '|']
+    if not columnas:
+        return texto
+
+    filas_celdas = []
+    for fragmento in re.split(r'\\\\', cuerpo):
+        fila = fragmento.replace('\\hline', '')
+        if not fila.strip():
+            continue
+        filas_celdas.append(re.split(r'(?<!\\)&', fila))
+
+    def texto_visible(cadena: str) -> str:
+        # Aproximación: sustituye \comando{arg} por su argumento y elimina comandos sin
+        # argumento, para no contar los backslashes/nombres de comando como si fueran texto.
+        cadena = re.sub(r'\\[a-zA-Z]+\{([^{}]*)\}', r'\1', cadena)
+        cadena = re.sub(r'\\[a-zA-Z]+', '', cadena)
+        return cadena.replace('{', '').replace('}', '').strip()
+
+    factor_cm_por_caracter = 0.19
+    relleno_cm = 0.5
+    ancho_minimo, ancho_maximo = 1.4, 6.0
+
+    anchos = []
+    for i in range(len(columnas)):
+        palabra_mas_larga = 0
+        for celdas in filas_celdas:
+            if i >= len(celdas):
+                continue
+            for palabra in texto_visible(celdas[i]).split():
+                palabra_mas_larga = max(palabra_mas_larga, len(palabra))
+        ancho = palabra_mas_larga * factor_cm_por_caracter + relleno_cm
+        anchos.append(max(ancho_minimo, min(ancho_maximo, ancho)))
+
+    nueva_spec_partes = []
+    idx_columna = 0
+    for token in tokens:
+        if token == '|':
+            nueva_spec_partes.append('|')
+            continue
+        ancho = anchos[idx_columna]
+        m = re.match(r'^(>\{[^}]*\})?p\{[^}]*\}$', token)
+        if m and m.group(1):
+            nueva_spec_partes.append(f"{m.group(1)}p{{{ancho:.2f}cm}}")
+        elif m:
+            nueva_spec_partes.append(f"p{{{ancho:.2f}cm}}")
+        else:
+            nueva_spec_partes.append(token)
+        idx_columna += 1
+
+    nueva_spec = ''.join(nueva_spec_partes)
+    if nueva_spec == spec:
+        return texto
+    return texto[:inicio + len(marcador)] + nueva_spec + texto[fin_spec:]
+
+
+def _espaciar_columnas_tabla(texto: str) -> str:
+    """El `\\tabcolsep` por defecto de LaTeX (6pt) deja casi sin aire el texto de columnas
+    contiguas en una tabla densa de varias columnas estrechas, pudiendo confundir dónde acaba
+    una columna y empieza la siguiente. Lo ampliamos justo alrededor de la tabla y lo
+    restauramos justo después, para no afectar a otras tablas del documento final donde se
+    pegue este fragmento."""
+    tabcolsep_ampliado = "\\setlength{\\tabcolsep}{8pt}\n"
+    tabcolsep_normal = "\n\\setlength{\\tabcolsep}{6pt}"
+
+    inicio = "\\begin{tabular}"
+    fin = "\\end{tabular}"
+    if inicio in texto and tabcolsep_ampliado not in texto:
+        texto = texto.replace(inicio, tabcolsep_ampliado + inicio, 1)
+        texto = texto.replace(fin, fin + tabcolsep_normal, 1)
+
+    return texto
+
+
+def _asegurar_resizebox_tabla(texto: str) -> str:
+    """Red de seguridad: si el LLM olvida envolver la tabla en `\\resizebox` pese a la
+    instrucción, lo forzamos por código para garantizar que la tabla completa siempre se
+    reescale a `\\textwidth` y quepa en una única página vertical, sin depender de que el LLM
+    lo recuerde en cada generación."""
+    if "\\begin{tabular}" not in texto or "\\resizebox" in texto:
+        return texto
+    texto = texto.replace("\\begin{tabular}", "\\resizebox{\\textwidth}{!}{\n\\begin{tabular}", 1)
+    texto = texto.replace("\\end{tabular}", "\\end{tabular}\n}", 1)
+    return texto
+
+
 def revision_final_node(state: AgentState):
     
     # Datos de control y contexto
@@ -1783,47 +2110,90 @@ def revision_final_node(state: AgentState):
     )
 
     prompt = f"""
-    Actúas como un transcriptor experto en tipografía científica y LaTeX. Tu única misión es fusionar los textos provistos en el apartado "TEXTOS A FUSIONAR" y devolver la sección "Related Works" estructurada EXCLUSIVAMENTE en código LaTeX profesional.
+    Actúas como un editor académico senior y experto en tipografía científica LaTeX, encargado del pulido final de la sección "Related Works" de un paper científico. Tu trabajo tiene DOS FASES obligatorias: primero REVISAS y MEJORAS el contenido de los textos provistos, y después los ENSAMBLAS en un único documento LaTeX profesional. La salida debe ser EXCLUSIVAMENTE el código LaTeX final (nunca muestres las fases por separado).
+
+    ==================================================
+    FASE 1 — REVISIÓN Y MEJORA DE CONTENIDO
+    ==================================================
+    Antes de fusionar nada, revisa internamente estos tres textos y genera una versión mejorada de cada uno (conservando el idioma original y las ideas/datos de fondo, sin inventar información nueva sobre los trabajos):
+
+    1. INTRODUCCIÓN: Púlela para que funcione como una introducción canónica de una sección "Related Works": debe contextualizar brevemente el ámbito, indicar el criterio de organización usado (por categorías o de forma cronológica/temática) y preparar al lector para el cuerpo que sigue. Corrige transiciones abruptas, repeticiones o frases genéricas de relleno.
+
+    2. DESCRIPCIÓN DE LA TABLA COMPARATIVA: Revísala y mejórala en claridad y tono académico. Debe introducir la tabla y explicar sus criterios de comparación de la mejor manera posible siguiendo un formato tipo listado. La primera frase del párrafo introductorio DEBE mencionar explícitamente la tabla mediante la referencia LaTeX `Tabla~\\ref{{tab:related_works_comparativa}}` (con ese `~` y esa clave exactos) en vez de un número escrito a mano como "Tabla 1": LaTeX resolverá el número real automáticamente a partir del `\\label{{}}` que se añade a la tabla en el punto 4 de la Fase 2, sea cual sea la posición final de esta tabla dentro del paper completo donde se pegue este fragmento.
+
+    3. CONCLUSIÓN (la revisión más importante y exhaustiva de las tres): Reescríbela para que actúe como un cierre comparativo real entre el estado del arte analizado y el trabajo propio, usando como referencia la ficha técnica del trabajo propio:
+    {json.dumps(paper_propio, indent=2, ensure_ascii=False) if isinstance(paper_propio, dict) else paper_propio}
+       La conclusión final DEBE:
+       - Resumir de forma sintética lo visto en los trabajos relacionados (fortalezas y debilidades/inconvenientes comunes).
+       - Señalar explícitamente el gap o vacío que queda sin resolver en el estado del arte.
+       - Explicar cómo el trabajo propio (título, metodología y aportaciones de la ficha técnica anterior) cubre precisamente ese gap, realzando su valor frente a lo existente.
+       - Mantenerse como prosa académica fluida en un único párrafo (sin listas ni viñetas), sin perder ninguna idea válida ya presente en el borrador original de la conclusión.
+
+    ==================================================
+    FASE 2 — ENSAMBLADO EN LATEX
+    ==================================================
+    Usa las versiones YA MEJORADAS de la Fase 1 (introducción, descripción de tabla y conclusión) junto con el resto de textos tal cual se proveen, y ensámblalas siguiendo estas reglas:
 
     INSTRUCCIONES DE FORMATO LATEX (CRÍTICAS):
-    1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{{Related Works}}` al inicio. Para los subtítulos (si hay categorías), utiliza `\\subsection{{Nombre de la Categoría}}`.
-    2. CITAS EN EL TEXTO: En el cuerpo de los trabajos relacionados, busca dónde se menciona cada paper. Justo después de escribir el título de un trabajo, debes insertar su comando de cita correspondiente. Sigue estrictamente esta guía de mapeo:
+    1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{{Related Works}}` al inicio. Si hay categorías, NO uses `\\subsection{{}}` ni ningún comando de sección/subsección para los títulos de categoría: "Related Works" no tiene subsecciones propias, así que estos títulos deben ser tipográficamente discretos, no divisorios. En su lugar, antes de los párrafos de cada categoría, inserta una línea con el nombre de la categoría en negrita (sin color), precedido de su número romano en mayúsculas seguido de paréntesis, con este formato exacto: `\\par\\noindent\\textbf{{I) Nombre de la Categoría}}\\par` (usa I, II, III, IV... en el orden en que aparecen las categorías, nunca números arábigos). Los `\\par` son obligatorios e inmediatamente pegados al `\\textbf{{}}` (sin depender de líneas en blanco): el título de categoría DEBE quedar en su propio párrafo, y el primer párrafo de un trabajo de esa categoría nunca debe empezar en la misma línea/párrafo que el título.
+    2. CITAS EN EL TEXTO: En el cuerpo de los trabajos relacionados, busca dónde se menciona cada paper. Justo después de escribir el título de un trabajo, debes insertar su comando de cita correspondiente, con este formato exacto: "Título del trabajo \\cite{{ref-x}}". Sigue estrictamente esta guía de mapeo:
     {guia_citas_str}
-    3. CITAS EN LA TABLA: En la celda del título de cada paper dentro de la tabla de LaTeX, debes incluir también su respectivo comando `\\cite{{ref-x}}`.
-    4. TRADUCCIÓN DE LA TABLA A LATEX: Transforma la tabla comparativa actual (que viene en Markdown) a un entorno profesional de LaTeX utilizando `\\begin{{table}}[h]`, `\\centering`, y el entorno `\\begin{{tabular}}`. Utiliza `\\hline` para separar las cabeceras y las filas adecuadamente. Asegúrate de escapar caracteres conflictivos de LaTeX si aparecen en el texto (como % o _).
+    3. CITAS EN LA TABLA: En la celda del título de cada paper dentro de la tabla de LaTeX, debes incluir también su respectivo comando `\\cite{{ref-x}}` junto al título.
+    4. FORMATO Y AJUSTE DE LA TABLA A LA PÁGINA (CRÍTICO — la tabla debe quedar SIEMPRE como una única tabla compacta en una página vertical normal, nunca partida en varias páginas ni cortada por el margen): Transforma la tabla comparativa actual (que viene en Markdown) a LaTeX siguiendo SIEMPRE estas reglas, sin excepción y sin evaluar el número de columnas:
+       a. ORIENTACIÓN Y ESCALADO OBLIGATORIOS: Usa SIEMPRE una página vertical normal (nunca el entorno `landscape`). Envuelve el `tabular` completo dentro de `\\resizebox{{\\textwidth}}{{!}}{{ ... }}`, de modo que LaTeX reescale automáticamente toda la tabla (incluida la letra) al ancho exacto de la página, sin importar cuántas columnas o filas tenga ni cuánto texto lleve cada celda. Esto es obligatorio siempre: nunca dejes la tabla a tamaño natural sin `\\resizebox`.
+       b. UNA SOLA TABLA, SIN PAGINACIÓN: NUNCA uses el entorno `longtable` ni ningún mecanismo que reparta la tabla en varias páginas. Usa siempre `\\begin{{table}}[h]` con un único `tabular` interno dentro del `\\resizebox`, con TODAS las filas (cabecera + un paper por fila + trabajo propio) juntas en esa única tabla, por muchas filas que tenga: al estar reescalada con `\\resizebox`, siempre cabe en el ancho de la página aunque el texto quede más pequeño — eso es intencionado y aceptable (se asume que el lector puede hacer zoom en el PDF si hace falta).
+       c. ANCHO DE COLUMNAS Y AJUSTE DE LÍNEA (CRÍTICO para que ninguna palabra se salga de su celda e invada la columna vecina): PROHIBIDO usar los tipos de columna simples `l`, `c` o `r` sin ancho fijo, para CUALQUIER columna, incluidas las columnas binarias de Sí/No. Ese tipo de columna NUNCA envuelve el texto —ni el de la celda ni el de la cabecera—, así que basta con que la cabecera o una celda midan más que el hueco disponible para que el texto invada visualmente la columna de al lado. Usa SIEMPRE `p{{Xcm}}` para TODAS las columnas (idealmente `>{{\\raggedright\\arraybackslash}}p{{Xcm}}` para columnas de texto descriptivo, o `>{{\\centering\\arraybackslash}}p{{Xcm}}` para columnas binarias de Sí/No), donde X es un ancho en centímetros: esto obliga a LaTeX a partir el texto en varias líneas dentro de la celda —incluida la fila de cabecera— en lugar de desbordarlo. Da a las columnas binarias un ancho mínimo de 1.5cm para que su cabecera quepa cómodamente en 2-3 líneas, y reparte el resto del ancho entre las columnas descriptivas de forma proporcional a la cantidad de texto esperado en cada una (p. ej. la columna de Título puede llevar más ancho que las demás). No te preocupes por que la suma total coincida con `\\textwidth`: como la tabla completa se reescala después con `\\resizebox`, lo único relevante es la proporción relativa entre columnas, no su ancho absoluto.
+       d. TAMAÑO DE FUENTE: usa el tamaño de letra normal del documento dentro de la tabla (NO uses `\\small` ni `\\footnotesize` manualmente); el escalado final para que quepa en la página ya lo controla `\\resizebox` automáticamente.
+       e. CENTRADO: añade `\\centering` dentro del entorno `table`, inmediatamente antes del `\\resizebox`.
+       f. El resto del formateo estándar se mantiene: `\\hline` para separar cabecera y filas, y escapar cualquier carácter conflictivo de LaTeX (%, _, &, etc.) que aparezca en el contenido de las celdas.
+       g. PALABRAS COMPUESTAS CON "/": Si en una cabecera o celda aparecen dos palabras unidas por "/" sin espacios (p. ej. "Ventajas/Desventajas"), sustituye ese "/" literal por el comando `\\slash{{}}` (nunca dejes un "/" a pelo en ese caso). LaTeX trata "/" como un carácter no divisible; `\\slash{{}}` se ve igual pero permite partir la línea en ese punto.
+       h. TÍTULO Y NUMERACIÓN DE LA TABLA (OBLIGATORIO): justo después de `\\centering`, añade un `\\caption{{...}}` breve y académico que resuma qué compara la tabla (basado en sus columnas y en el tema del paper), y justo después del `\\caption{{}}` añade `\\label{{tab:related_works_comparativa}}` (usa EXACTAMENTE esa clave, sin variarla, para que coincida con la referencia `\\ref{{}}` del punto 2 de la Fase 1). NUNCA escribas tú mismo un número de tabla fijo como "Tabla 1": dejando `\\caption{{}}` + `\\label{{}}` en la tabla y `\\ref{{}}` en la descripción, LaTeX calculará el número real automáticamente según la posición de esta tabla dentro del paper completo donde se pegue el fragmento.
     5. TEXTO CONTINUO: Asegúrate de que los párrafos se unifiquen sin costuras ortográficas o mayúsculas erróneas producto de la concatenación. Usa salto de línea doble en LaTeX para separar párrafos.
+    6. HOMOGENEIZACIÓN: Unifica el registro y el tono de todos los bloques (introducción, cuerpo, descripción de tabla, conclusión) para que se lean como un único texto académico coherente, sin cambios bruscos de estilo entre secciones.
 
-    ORDEN DEL DOCUMENTO LATEX (ESTRICTO):
-    1. `\\section{{Related Works}}`
-    2. Texto de la INTRODUCCIÓN.
-    3. CUERPO DE TRABAJOS RELACIONADOS (Con sus subsecciones si hay categorías y comandos `\\cite{{}}` insertados).
-    4. DESCRIPCIÓN DE LA TABLA COMPARATIVA.
-    5. Entorno completo de la TABLA (`\\begin{{table}}` ... `\\end{{table}}`).
-    6. CONCLUSIÓN DE LA SECCIÓN.
-    7. Entorno de BIBLIOGRAFÍA (Copia exactamente el bloque de bibliografía en LaTeX provisto abajo).
+    ORDEN DEL DOCUMENTO LATEX (ESTRICTO — bloques consecutivos, PROHIBIDO intercalar contenido de un bloque dentro de otro; por ejemplo, nunca dejes una frase de la descripción de la tabla suelta después de la propia tabla): Para que se pueda verificar automáticamente que el orden es correcto, escribe el comentario LaTeX exacto indicado entre comillas al principio de cada bloque, en su propia línea, EXACTAMENTE UNA VEZ cada uno y en este orden (son comentarios `%`, invisibles al compilar, así que no afectan al PDF):
+    1. "% SECCION:INTRODUCCION" seguido de `\\section{{Related Works}}` y el texto de la INTRODUCCIÓN (versión mejorada de la Fase 1).
+    2. "% SECCION:CUERPO" seguido del CUERPO DE TRABAJOS RELACIONADOS completo (con las marcas de categoría en negrita y numeración romana si hay categorías, y comandos `\\cite{{}}` insertados).
+    3. "% SECCION:DESCRIPCION_TABLA" seguido del texto ÍNTEGRO de la DESCRIPCIÓN DE LA TABLA COMPARATIVA (versión mejorada de la Fase 1): el párrafo completo debe ir aquí, sin dejar ninguna frase suelta para después de la tabla, y debe incluir la referencia `Tabla~\\ref{{tab:related_works_comparativa}}` según el punto 2 de la Fase 1.
+    4. "% SECCION:TABLA" seguido del entorno completo de la TABLA (`\\begin{{table}}[h]` con `\\caption{{}}` y `\\label{{tab:related_works_comparativa}}` según el punto 4.h anterior, y el `tabular` envuelto en `\\resizebox{{\\textwidth}}{{!}}{{...}}`, según las reglas del punto 4 anterior), con citas en la columna del título.
+    5. "% SECCION:CONCLUSION" seguido de la CONCLUSIÓN DE LA SECCIÓN (versión mejorada de la Fase 1).
+    6. "% SECCION:BIBLIOGRAFIA" seguido del entorno de BIBLIOGRAFÍA (copia exactamente el bloque de bibliografía en LaTeX provisto abajo, sin modificarlo).
 
     PROHIBICIONES ABSOLUTAS:
     - NO utilices sintaxis Markdown (*, #, **, etc.) en ninguna parte del output. Todo debe ser LaTeX.
+    - NO envuelvas el resultado entre delimitadores de bloque de código Markdown (``` ```latex ``` ``` , ``` ``` ```, etc.). El output debe ser LaTeX puro de principio a fin: la primera línea debe ser literalmente `\\section{{Related Works}}` y la última debe ser literalmente `\\end{{thebibliography}}`, sin ningún carácter antes ni después.
     - NO añadas preámbulos de documento completo (`\\documentclass`, `\\begin{{document}}`, etc.). Solo el fragmento del capítulo.
-    - NO agregues textos de saludo, explicaciones o comentarios finales sobre el idioma. El output debe empezar directamente con el comando `\\section`.
+    - NO agregues textos de saludo, explicaciones, ni comentarios sobre las fases de revisión. El output debe empezar directamente con el comando `\\section` y ser únicamente el documento LaTeX final.
 
-    TEXTOS A FUSIONAR:
-    - INTRODUCCIÓN: {introduccion}
-    - CUERPO DE TRABAJOS: {cuerpo}
-    - DESCRIPCIÓN DE TABLA: {descripcion}
+    TEXTOS BASE A REVISAR Y FUSIONAR:
+    - INTRODUCCIÓN (borrador): {introduccion}
+    - CUERPO DE TRABAJOS (no requiere reescritura de contenido, solo insertar citas): {cuerpo}
+    - DESCRIPCIÓN DE TABLA (borrador): {descripcion}
     - TABLA COMPARATIVA (MARKDOWN ACTUAL): {tabla}
-    - CONCLUSIÓN: {conclusion}
+    - CONCLUSIÓN (borrador): {conclusion}
 
-    BLOQUE DE BIBLIOGRAFÍA EN LATEX A PEGAR AL FINAL:
+    BLOQUE DE BIBLIOGRAFÍA EN LATEX A PEGAR AL FINAL (cópialo tal cual, no lo reescribas):
     {bloque_bibliografia_latex}
 
-    IDIOMA: {idioma} pulido de alto nivel.
+    IDIOMA: El documento LaTeX debe estar en {idioma} pulido de alto nivel, registro académico.
     """
 
     try:
         response = llm_complejo.invoke(prompt)
         texto_final_latex = response.content.strip()
-        
+
+        # Post-procesado determinista: no confiamos en que el LLM cumpla siempre estas
+        # reglas de formato al pie de la letra, así que las forzamos por código.
+        texto_final_latex = _limpiar_fences_markdown(texto_final_latex)
+        texto_final_latex = _forzar_orden_secciones(texto_final_latex)
+        texto_final_latex = _forzar_parrafo_tras_titulos_categoria(texto_final_latex)
+        texto_final_latex = _eliminar_entorno_landscape(texto_final_latex)
+        texto_final_latex = _eliminar_longtable(texto_final_latex)
+        texto_final_latex = _forzar_wrap_columnas_tabla(texto_final_latex)
+        texto_final_latex = _ajustar_anchos_columnas_segun_contenido(texto_final_latex)
+        texto_final_latex = _espaciar_columnas_tabla(texto_final_latex)
+        texto_final_latex = _asegurar_resizebox_tabla(texto_final_latex)
+
         # Aseguramos el bloque de cierre por si el LLM sufriera algún truncamiento menor
         if "\\begin{thebibliography}" not in texto_final_latex:
             texto_final_latex += "\n\n" + bloque_bibliografia_latex
