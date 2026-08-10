@@ -2063,16 +2063,23 @@ MARCADORES_ORDEN_SECCIONES = [
 ]
 
 
-def _forzar_orden_secciones(texto: str) -> str:
+def _forzar_orden_secciones(texto: str, marcadores: list = None) -> str:
     """Red de seguridad: el ensamblado final se genera en una única pasada de texto libre y el
     LLM a veces intercala fragmentos de un bloque dentro de otro (p. ej. deja parte de la
     descripción de la tabla después de la propia tabla). Le pedimos que marque el inicio de
     cada bloque con un comentario LaTeX exclusivo (invisible en el PDF) y aquí reconstruimos el
     documento completo recortando por esos marcadores y reordenando los bloques en el orden
     correcto, sea cual sea el orden en que el LLM los haya escrito. Si falta algún marcador (el
-    LLM no siguió la instrucción), no tocamos nada y devolvemos el texto tal cual."""
+    LLM no siguió la instrucción), no tocamos nada y devolvemos el texto tal cual.
+
+    `marcadores` permite pasar el subconjunto de bloques realmente pedidos al LLM en esta
+    ejecución (p. ej. sin los de tabla cuando la tabla comparativa no está activa); por defecto
+    usa la lista completa `MARCADORES_ORDEN_SECCIONES`."""
+    if marcadores is None:
+        marcadores = MARCADORES_ORDEN_SECCIONES
+
     posiciones = {}
-    for marcador in MARCADORES_ORDEN_SECCIONES:
+    for marcador in marcadores:
         idx = texto.find(marcador)
         if idx == -1:
             return texto
@@ -2085,7 +2092,7 @@ def _forzar_orden_secciones(texto: str) -> str:
         fin = marcadores_por_posicion[i + 1][1] if i + 1 < len(marcadores_por_posicion) else len(texto)
         bloques[marcador] = texto[idx + len(marcador):fin].strip("\n")
 
-    return "\n\n".join(bloques[marcador] for marcador in MARCADORES_ORDEN_SECCIONES)
+    return "\n\n".join(bloques[marcador] for marcador in marcadores)
 
 
 def _ajustar_anchos_columnas_segun_contenido(texto: str) -> str:
@@ -2215,6 +2222,17 @@ def revision_final_node(state: AgentState):
     categorias = state.get("categorias_propuestas", "")
     estructura_tabla = state.get("estructura_tabla_propuesta", "")
 
+    # La tabla comparativa (y su descripción) solo existen si el usuario la activó en su
+    # momento: si no, no hay que pedirle al LLM que las revise/genere/ensamble, porque
+    # "descripcion"/"tabla" (ver abajo) estarán vacías y el LLM las inventaría de la nada.
+    tabla_activa = bool(state.get("tabla_comparativa_activa"))
+
+    # Igual que con la tabla: si el usuario no activó la categorización, el "cuerpo" ya viene
+    # redactado como prosa continua (sin agrupar por categorías) desde
+    # redactar_trabajos_relacionados_node. Sin esta bandera, el LLM de este nodo tiende a
+    # "reorganizar" el cuerpo en categorías inventadas por su cuenta al pulirlo.
+    categorizar_activo = bool(state.get("categorizar_activo"))
+
     # Textos reales que deben ser fusionados
     introduccion = state.get("introduccion_related_works", "")
     cuerpo = state.get("related_works_section", "")
@@ -2251,35 +2269,20 @@ def revision_final_node(state: AgentState):
         "\n\\end{thebibliography}"
     )
 
-    prompt = f"""
-    Actúas como un editor académico senior y experto en tipografía científica LaTeX, encargado del pulido final de la sección "Related Works" de un paper científico. Tu trabajo tiene DOS FASES obligatorias: primero REVISAS y MEJORAS el contenido de los textos provistos, y después los ENSAMBLAS en un único documento LaTeX profesional. La salida debe ser EXCLUSIVAMENTE el código LaTeX final (nunca muestres las fases por separado).
+    # --- Bloques condicionados a si la tabla comparativa está activa en esta sesión ---
+    # (numerados dinámicamente para que la numeración del prompt siga siendo correlativa
+    # tanto si la tabla está presente como si no).
 
-    ==================================================
-    FASE 1 — REVISIÓN Y MEJORA DE CONTENIDO
-    ==================================================
-    Antes de fusionar nada, revisa internamente estos tres textos y genera una versión mejorada de cada uno (conservando el idioma original y las ideas/datos de fondo, sin inventar información nueva sobre los trabajos):
-
-    1. INTRODUCCIÓN: Púlela para que funcione como una introducción canónica de una sección "Related Works": debe contextualizar brevemente el ámbito, indicar el criterio de organización usado (por categorías o de forma cronológica/temática) y preparar al lector para el cuerpo que sigue. Corrige transiciones abruptas, repeticiones o frases genéricas de relleno.
-
+    item_fase1_tabla = ""
+    if tabla_activa:
+        item_fase1_tabla = f"""
     2. DESCRIPCIÓN DE LA TABLA COMPARATIVA: Revísala y mejórala en claridad y tono académico. Debe introducir la tabla y explicar sus criterios de comparación de la mejor manera posible siguiendo un formato tipo listado. La primera frase del párrafo introductorio DEBE mencionar explícitamente la tabla mediante la referencia LaTeX `Tabla~\\ref{{tab:related_works_comparativa}}` (con ese `~` y esa clave exactos) en vez de un número escrito a mano como "Tabla 1": LaTeX resolverá el número real automáticamente a partir del `\\label{{}}` que se añade a la tabla en el punto 4 de la Fase 2, sea cual sea la posición final de esta tabla dentro del paper completo donde se pegue este fragmento.
+"""
+    num_fase1_conclusion = "3" if tabla_activa else "2"
 
-    3. CONCLUSIÓN (la revisión más importante y exhaustiva de las tres): Reescríbela para que actúe como un cierre comparativo real entre el estado del arte analizado y el trabajo propio, usando como referencia la ficha técnica del trabajo propio:
-    {json.dumps(paper_propio, indent=2, ensure_ascii=False) if isinstance(paper_propio, dict) else paper_propio}
-       La conclusión final DEBE:
-       - Resumir de forma sintética lo visto en los trabajos relacionados (fortalezas y debilidades/inconvenientes comunes).
-       - Señalar explícitamente el gap o vacío que queda sin resolver en el estado del arte.
-       - Explicar cómo el trabajo propio (título, metodología y aportaciones de la ficha técnica anterior) cubre precisamente ese gap, realzando su valor frente a lo existente.
-       - Mantenerse como prosa académica fluida en un único párrafo (sin listas ni viñetas), sin perder ninguna idea válida ya presente en el borrador original de la conclusión.
-
-    ==================================================
-    FASE 2 — ENSAMBLADO EN LATEX
-    ==================================================
-    Usa las versiones YA MEJORADAS de la Fase 1 (introducción, descripción de tabla y conclusión) junto con el resto de textos tal cual se proveen, y ensámblalas siguiendo estas reglas:
-
-    INSTRUCCIONES DE FORMATO LATEX (CRÍTICAS):
-    1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{{Related Works}}` al inicio. Si hay categorías, NO uses `\\subsection{{}}` ni ningún comando de sección/subsección para los títulos de categoría: "Related Works" no tiene subsecciones propias, así que estos títulos deben ser tipográficamente discretos, no divisorios. En su lugar, antes de los párrafos de cada categoría, inserta una línea con el nombre de la categoría en negrita (sin color), precedido de su número romano en mayúsculas seguido de paréntesis, con este formato exacto: `\\par\\noindent\\textbf{{I) Nombre de la Categoría}}\\par` (usa I, II, III, IV... en el orden en que aparecen las categorías, nunca números arábigos). Los `\\par` son obligatorios e inmediatamente pegados al `\\textbf{{}}` (sin depender de líneas en blanco): el título de categoría DEBE quedar en su propio párrafo, y el primer párrafo de un trabajo de esa categoría nunca debe empezar en la misma línea/párrafo que el título.
-    2. CITAS EN EL TEXTO: En el cuerpo de los trabajos relacionados, busca dónde se menciona cada paper. Justo después de escribir el título de un trabajo, debes insertar su comando de cita correspondiente, con este formato exacto: "Título del trabajo \\cite{{ref-x}}". Sigue estrictamente esta guía de mapeo:
-    {guia_citas_str}
+    bloque_fase2_tabla = ""
+    if tabla_activa:
+        bloque_fase2_tabla = f"""
     3. CITAS EN LA TABLA: En la celda del título de cada paper dentro de la tabla de LaTeX, debes incluir también su respectivo comando `\\cite{{ref-x}}` junto al título.
     4. FORMATO Y AJUSTE DE LA TABLA A LA PÁGINA (CRÍTICO — la tabla debe quedar SIEMPRE como una única tabla compacta en una página vertical normal, nunca partida en varias páginas ni cortada por el margen): Transforma la tabla comparativa actual (que viene en Markdown) a LaTeX siguiendo SIEMPRE estas reglas, sin excepción y sin evaluar el número de columnas:
        a. ORIENTACIÓN Y ESCALADO OBLIGATORIOS: Usa SIEMPRE una página vertical normal (nunca el entorno `landscape`). Envuelve el `tabular` completo dentro de `\\resizebox{{\\textwidth}}{{!}}{{ ... }}`, de modo que LaTeX reescale automáticamente toda la tabla (incluida la letra) al ancho exacto de la página, sin importar cuántas columnas o filas tenga ni cuánto texto lleve cada celda. Esto es obligatorio siempre: nunca dejes la tabla a tamaño natural sin `\\resizebox`.
@@ -2290,16 +2293,84 @@ def revision_final_node(state: AgentState):
        f. El resto del formateo estándar se mantiene: `\\hline` para separar cabecera y filas, y escapar cualquier carácter conflictivo de LaTeX (%, _, &, etc.) que aparezca en el contenido de las celdas.
        g. PALABRAS COMPUESTAS CON "/": Si en una cabecera o celda aparecen dos palabras unidas por "/" sin espacios (p. ej. "Ventajas/Desventajas"), sustituye ese "/" literal por el comando `\\slash{{}}` (nunca dejes un "/" a pelo en ese caso). LaTeX trata "/" como un carácter no divisible; `\\slash{{}}` se ve igual pero permite partir la línea en ese punto.
        h. TÍTULO Y NUMERACIÓN DE LA TABLA (OBLIGATORIO): justo después de `\\centering`, añade un `\\caption{{...}}` breve y académico que resuma qué compara la tabla (basado en sus columnas y en el tema del paper), y justo después del `\\caption{{}}` añade `\\label{{tab:related_works_comparativa}}` (usa EXACTAMENTE esa clave, sin variarla, para que coincida con la referencia `\\ref{{}}` del punto 2 de la Fase 1). NUNCA escribas tú mismo un número de tabla fijo como "Tabla 1": dejando `\\caption{{}}` + `\\label{{}}` en la tabla y `\\ref{{}}` en la descripción, LaTeX calculará el número real automáticamente según la posición de esta tabla dentro del paper completo donde se pegue el fragmento.
-    5. TEXTO CONTINUO: Asegúrate de que los párrafos se unifiquen sin costuras ortográficas o mayúsculas erróneas producto de la concatenación. Usa salto de línea doble en LaTeX para separar párrafos.
-    6. HOMOGENEIZACIÓN: Unifica el registro y el tono de todos los bloques (introducción, cuerpo, descripción de tabla, conclusión) para que se lean como un único texto académico coherente, sin cambios bruscos de estilo entre secciones.
+"""
+    num_fase2_texto_continuo = "5" if tabla_activa else "3"
+    num_fase2_homogeneizacion = "6" if tabla_activa else "4"
 
-    ORDEN DEL DOCUMENTO LATEX (ESTRICTO — bloques consecutivos, PROHIBIDO intercalar contenido de un bloque dentro de otro; por ejemplo, nunca dejes una frase de la descripción de la tabla suelta después de la propia tabla): Para que se pueda verificar automáticamente que el orden es correcto, escribe el comentario LaTeX exacto indicado entre comillas al principio de cada bloque, en su propia línea, EXACTAMENTE UNA VEZ cada uno y en este orden (son comentarios `%`, invisibles al compilar, así que no afectan al PDF):
-    1. "% SECCION:INTRODUCCION" seguido de `\\section{{Related Works}}` y el texto de la INTRODUCCIÓN (versión mejorada de la Fase 1).
-    2. "% SECCION:CUERPO" seguido del CUERPO DE TRABAJOS RELACIONADOS completo (con las marcas de categoría en negrita y numeración romana si hay categorías, y comandos `\\cite{{}}` insertados).
-    3. "% SECCION:DESCRIPCION_TABLA" seguido del texto ÍNTEGRO de la DESCRIPCIÓN DE LA TABLA COMPARATIVA (versión mejorada de la Fase 1): el párrafo completo debe ir aquí, sin dejar ninguna frase suelta para después de la tabla, y debe incluir la referencia `Tabla~\\ref{{tab:related_works_comparativa}}` según el punto 2 de la Fase 1.
-    4. "% SECCION:TABLA" seguido del entorno completo de la TABLA (`\\begin{{table}}[h]` con `\\caption{{}}` y `\\label{{tab:related_works_comparativa}}` según el punto 4.h anterior, y el `tabular` envuelto en `\\resizebox{{\\textwidth}}{{!}}{{...}}`, según las reglas del punto 4 anterior), con citas en la columna del título.
-    5. "% SECCION:CONCLUSION" seguido de la CONCLUSIÓN DE LA SECCIÓN (versión mejorada de la Fase 1).
-    6. "% SECCION:BIBLIOGRAFIA" seguido del entorno de BIBLIOGRAFÍA (copia exactamente el bloque de bibliografía en LaTeX provisto abajo, sin modificarlo).
+    orden_bloques = [
+        '1. "% SECCION:INTRODUCCION" seguido de `\\section{Related Works}` y el texto de la INTRODUCCIÓN (versión mejorada de la Fase 1).',
+        '2. "% SECCION:CUERPO" seguido del CUERPO DE TRABAJOS RELACIONADOS completo (con las marcas de categoría en negrita y numeración romana si hay categorías, y comandos `\\cite{}` insertados).',
+    ]
+    if tabla_activa:
+        orden_bloques.append('3. "% SECCION:DESCRIPCION_TABLA" seguido del texto ÍNTEGRO de la DESCRIPCIÓN DE LA TABLA COMPARATIVA (versión mejorada de la Fase 1): el párrafo completo debe ir aquí, sin dejar ninguna frase suelta para después de la tabla, y debe incluir la referencia `Tabla~\\ref{tab:related_works_comparativa}` según el punto 2 de la Fase 1.')
+        orden_bloques.append('4. "% SECCION:TABLA" seguido del entorno completo de la TABLA (`\\begin{table}[h]` con `\\caption{}` y `\\label{tab:related_works_comparativa}` según el punto 4.h anterior, y el `tabular` envuelto en `\\resizebox{\\textwidth}{!}{...}`, según las reglas del punto 4 anterior), con citas en la columna del título.')
+    num_conclusion = "5" if tabla_activa else "3"
+    num_bibliografia = "6" if tabla_activa else "4"
+    orden_bloques.append(f'{num_conclusion}. "% SECCION:CONCLUSION" seguido de la CONCLUSIÓN DE LA SECCIÓN (versión mejorada de la Fase 1).')
+    orden_bloques.append(f'{num_bibliografia}. "% SECCION:BIBLIOGRAFIA" seguido del entorno de BIBLIOGRAFÍA (copia exactamente el bloque de bibliografía en LaTeX provisto abajo, sin modificarlo).')
+    orden_bloques_str = "\n    ".join(orden_bloques)
+
+    lineas_textos_base = [
+        f"    - INTRODUCCIÓN (borrador): {introduccion}",
+        f"    - CUERPO DE TRABAJOS (no requiere reescritura de contenido, solo insertar citas): {cuerpo}",
+    ]
+    if tabla_activa:
+        lineas_textos_base.append(f"    - DESCRIPCIÓN DE TABLA (borrador): {descripcion}")
+        lineas_textos_base.append(f"    - TABLA COMPARATIVA (MARKDOWN ACTUAL): {tabla}")
+    lineas_textos_base.append(f"    - CONCLUSIÓN (borrador): {conclusion}")
+    textos_base_str = "\n".join(lineas_textos_base)
+
+    aviso_sin_tabla = "" if tabla_activa else "\n    NOTA: Esta sección NO incluye tabla comparativa (el usuario no la solicitó). NO generes ninguna tabla, ni su descripción, ni ningún marcador `% SECCION:DESCRIPCION_TABLA` / `% SECCION:TABLA`: pasa directamente del cuerpo de trabajos a la conclusión.\n"
+
+    aviso_sin_categorias = "" if categorizar_activo else "\n    NOTA: El CUERPO DE TRABAJOS que se te provee está redactado en PROSA CONTINUA, SIN categorías temáticas (el usuario no activó la categorización). NO agrupes ni reorganices los trabajos en categorías inventadas por tu cuenta, NO añadas subtítulos ni títulos en negrita con numeración romana de ningún tipo: limítate a insertar las citas sobre el texto tal cual te lo proveemos, respetando su estructura de párrafos.\n"
+
+    # Criterio de organización real de esta ejecución, para que la introducción no invente
+    # (ni sugiera con ambigüedad) un criterio de categorías que en realidad no se usó.
+    criterio_organizacion = (
+        "por categorías temáticas (el cuerpo ya está agrupado así)"
+        if categorizar_activo
+        else "de forma continua, sin categorías temáticas (el cuerpo es prosa corrida, un trabajo tras otro)"
+    )
+
+    linea_estructura_secciones = (
+        '1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{Related Works}` al inicio. Si hay categorías, NO uses `\\subsection{}` ni ningún comando de sección/subsección para los títulos de categoría: "Related Works" no tiene subsecciones propias, así que estos títulos deben ser tipográficamente discretos, no divisorios. En su lugar, antes de los párrafos de cada categoría, inserta una línea con el nombre de la categoría en negrita (sin color), precedido de su número romano en mayúsculas seguido de paréntesis, con este formato exacto: `\\par\\noindent\\textbf{I) Nombre de la Categoría}\\par` (usa I, II, III, IV... en el orden en que aparecen las categorías, nunca números arábigos). Los `\\par` son obligatorios e inmediatamente pegados al `\\textbf{}` (sin depender de líneas en blanco): el título de categoría DEBE quedar en su propio párrafo, y el primer párrafo de un trabajo de esa categoría nunca debe empezar en la misma línea/párrafo que el título.'
+        if categorizar_activo else
+        '1. ESTRUCTURA DE SECCIONES: Utiliza el comando `\\section{Related Works}` al inicio. El cuerpo de trabajos relacionados NO está organizado por categorías: NO uses `\\subsection{}`, NO inventes agrupaciones temáticas propias, y NO añadas títulos en negrita con numeración romana (ese formato es exclusivo de cuando sí existen categorías, que no es el caso aquí). Mantén el cuerpo como prosa continua tal cual se provee, únicamente insertando las citas.'
+    )
+
+    prompt = f"""
+    Actúas como un editor académico senior y experto en tipografía científica LaTeX, encargado del pulido final de la sección "Related Works" de un paper científico. Tu trabajo tiene DOS FASES obligatorias: primero REVISAS y MEJORAS el contenido de los textos provistos, y después los ENSAMBLAS en un único documento LaTeX profesional. La salida debe ser EXCLUSIVAMENTE el código LaTeX final (nunca muestres las fases por separado).
+    {aviso_sin_tabla}{aviso_sin_categorias}
+    ==================================================
+    FASE 1 — REVISIÓN Y MEJORA DE CONTENIDO
+    ==================================================
+    Antes de fusionar nada, revisa internamente estos textos y genera una versión mejorada de cada uno (conservando el idioma original y las ideas/datos de fondo, sin inventar información nueva sobre los trabajos):
+
+    1. INTRODUCCIÓN: Púlela para que funcione como una introducción canónica de una sección "Related Works": debe contextualizar brevemente el ámbito, indicar que el criterio de organización usado es {criterio_organizacion}, y preparar al lector para el cuerpo que sigue. Corrige transiciones abruptas, repeticiones o frases genéricas de relleno. NO cambies el criterio de organización real: no menciones categorías si no las hay, ni omitas mencionarlas si sí existen.
+{item_fase1_tabla}
+    {num_fase1_conclusion}. CONCLUSIÓN (la revisión más importante y exhaustiva): Reescríbela para que actúe como un cierre comparativo real entre el estado del arte analizado y el trabajo propio, usando como referencia la ficha técnica del trabajo propio:
+    {json.dumps(paper_propio, indent=2, ensure_ascii=False) if isinstance(paper_propio, dict) else paper_propio}
+       La conclusión final DEBE:
+       - Resumir de forma sintética lo visto en los trabajos relacionados (fortalezas y debilidades/inconvenientes comunes).
+       - Señalar explícitamente el gap o vacío que queda sin resolver en el estado del arte.
+       - Explicar cómo el trabajo propio (título, metodología y aportaciones de la ficha técnica anterior) cubre precisamente ese gap, realzando su valor frente a lo existente.
+       - Mantenerse como prosa académica fluida en un único párrafo (sin listas ni viñetas), sin perder ninguna idea válida ya presente en el borrador original de la conclusión.
+
+    ==================================================
+    FASE 2 — ENSAMBLADO EN LATEX
+    ==================================================
+    Usa las versiones YA MEJORADAS de la Fase 1 junto con el resto de textos tal cual se proveen, y ensámblalas siguiendo estas reglas:
+
+    INSTRUCCIONES DE FORMATO LATEX (CRÍTICAS):
+    {linea_estructura_secciones}
+    2. CITAS EN EL TEXTO: En el cuerpo de los trabajos relacionados, busca dónde se menciona cada paper. Justo después de escribir el título de un trabajo, debes insertar su comando de cita correspondiente, con este formato exacto: "Título del trabajo \\cite{{ref-x}}". Sigue estrictamente esta guía de mapeo:
+    {guia_citas_str}
+{bloque_fase2_tabla}
+    {num_fase2_texto_continuo}. TEXTO CONTINUO: Asegúrate de que los párrafos se unifiquen sin costuras ortográficas o mayúsculas erróneas producto de la concatenación. Usa salto de línea doble en LaTeX para separar párrafos.
+    {num_fase2_homogeneizacion}. HOMOGENEIZACIÓN: Unifica el registro y el tono de todos los bloques para que se lean como un único texto académico coherente, sin cambios bruscos de estilo entre secciones.
+
+    ORDEN DEL DOCUMENTO LATEX (ESTRICTO — bloques consecutivos, PROHIBIDO intercalar contenido de un bloque dentro de otro): Para que se pueda verificar automáticamente que el orden es correcto, escribe el comentario LaTeX exacto indicado entre comillas al principio de cada bloque, en su propia línea, EXACTAMENTE UNA VEZ cada uno y en este orden (son comentarios `%`, invisibles al compilar, así que no afectan al PDF):
+    {orden_bloques_str}
 
     PROHIBICIONES ABSOLUTAS:
     - NO utilices sintaxis Markdown (*, #, **, etc.) en ninguna parte del output. Todo debe ser LaTeX.
@@ -2308,11 +2379,7 @@ def revision_final_node(state: AgentState):
     - NO agregues textos de saludo, explicaciones, ni comentarios sobre las fases de revisión. El output debe empezar directamente con el comando `\\section` y ser únicamente el documento LaTeX final.
 
     TEXTOS BASE A REVISAR Y FUSIONAR:
-    - INTRODUCCIÓN (borrador): {introduccion}
-    - CUERPO DE TRABAJOS (no requiere reescritura de contenido, solo insertar citas): {cuerpo}
-    - DESCRIPCIÓN DE TABLA (borrador): {descripcion}
-    - TABLA COMPARATIVA (MARKDOWN ACTUAL): {tabla}
-    - CONCLUSIÓN (borrador): {conclusion}
+{textos_base_str}
 
     BLOQUE DE BIBLIOGRAFÍA EN LATEX A PEGAR AL FINAL (cópialo tal cual, no lo reescribas):
     {bloque_bibliografia_latex}
@@ -2326,8 +2393,12 @@ def revision_final_node(state: AgentState):
 
         # Post-procesado determinista: no confiamos en que el LLM cumpla siempre estas
         # reglas de formato al pie de la letra, así que las forzamos por código.
+        marcadores_esperados = MARCADORES_ORDEN_SECCIONES if tabla_activa else [
+            m for m in MARCADORES_ORDEN_SECCIONES
+            if m not in ("% SECCION:DESCRIPCION_TABLA", "% SECCION:TABLA")
+        ]
         texto_final_latex = _limpiar_fences_markdown(texto_final_latex)
-        texto_final_latex = _forzar_orden_secciones(texto_final_latex)
+        texto_final_latex = _forzar_orden_secciones(texto_final_latex, marcadores_esperados)
         texto_final_latex = _forzar_parrafo_tras_titulos_categoria(texto_final_latex)
         texto_final_latex = _eliminar_entorno_landscape(texto_final_latex)
         texto_final_latex = _eliminar_longtable(texto_final_latex)
