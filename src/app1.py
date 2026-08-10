@@ -206,6 +206,14 @@ class PropuestaCategorias(BaseModel):
 
 # -------------------------------- METODOS AUXILIARES -------------------------------------
 
+def _truncar_texto(texto: str, limite: int) -> str:
+    """Recorta `texto` a `limite` caracteres y añade "..." SOLO si de verdad se ha recortado algo.
+    Evita el bug de mostrar "..." tras un texto que ya cabía entero, lo que hacía parecer cortados
+    títulos que en realidad estaban completos.
+    """
+    texto = texto or ""
+    return texto if len(texto) <= limite else texto[:limite].rstrip() + "..."
+
 def extraer_json_puro(texto: str):
     """Extrae el JSON eliminando cualquier texto extra del LLM."""
     try:
@@ -252,6 +260,26 @@ def extraer_json(texto: str):
             return None
     except Exception:
         return None
+
+def _normalizar_columnas(estructura):
+    """Red de seguridad: todo el pipeline de la tabla (estructuras_similares, mensajes al
+    usuario, generar_tabla_node) espera que "columnas" sea una lista plana de strings, pero un
+    LLM puede devolver en su lugar objetos tipo {"nombre": "...", "tipo": "descriptiva"} —
+    especialmente en proponer_estructura_node, cuyo prompt le pide razonar explícitamente sobre
+    el tipo de cada columna. Reducimos cada elemento a su nombre para blindar el resto del flujo.
+    """
+    if not estructura or "columnas" not in estructura:
+        return estructura
+
+    columnas_normalizadas = []
+    for c in estructura.get("columnas", []):
+        if isinstance(c, dict):
+            nombre = c.get("nombre") or c.get("name") or c.get("columna") or next(iter(c.values()), "")
+            columnas_normalizadas.append(str(nombre))
+        else:
+            columnas_normalizadas.append(str(c))
+    estructura["columnas"] = columnas_normalizadas
+    return estructura
 
 def estructuras_similares(e1, e2, umbral=0.7):
     if not e1 or not e2:
@@ -355,8 +383,45 @@ def definir_tematica_node(state: AgentState) -> AgentState:
         # Guardamos como diccionario estándar
         metadatos_dict = res_pydantic.model_dump()
 
+        # --- FICHA TÉCNICA EN MARKDOWN (para que gr.Chatbot la renderice legible por campos, en
+        # vez de un único bloque JSON en crudo) ---
+        def _cita_multilinea(texto):
+            lineas = (texto or "").strip().splitlines() or [""]
+            return [f"> {linea}" if linea.strip() else ">" for linea in lineas]
+
+        autores = metadatos_dict.get("autores") or []
+        casos_uso = metadatos_dict.get("casos_uso") or []
+
+        lineas_ficha = [
+            "### 🗂️ Ficha técnica de tu paper",
+            "",
+            f"**Título:** {metadatos_dict.get('titulo', '')}",
+            f"**Autores:** {', '.join(autores) if autores else 'No especificado'}",
+            f"**Año:** {metadatos_dict.get('anio', '')}",
+            "",
+            "**Problema específico:**",
+            "",
+            *_cita_multilinea(metadatos_dict.get("problema_especifico")),
+            "",
+            "**Metodología:**",
+            "",
+            *_cita_multilinea(metadatos_dict.get("metodologia_detallada")),
+            "",
+            "**Aportaciones clave:**",
+            "",
+            *_cita_multilinea(metadatos_dict.get("aportaciones_clave")),
+            "",
+            "**Limitaciones críticas:**",
+            "",
+            *_cita_multilinea(metadatos_dict.get("limitaciones_criticas")),
+            "",
+            "**Casos de uso:**",
+            "",
+            *([f"- {c}" for c in casos_uso] if casos_uso else ["- No especificado"]),
+        ]
+
         mensaje_agente = f"Temática del paper recibida correctamente. Realizando un análisis y estructuración de la información."
-        mensaje_agente2 = f"Ficha técnica generada: {json.dumps(metadatos_dict, ensure_ascii=False)}.\n"
+        mensaje_agente2 = "\n".join(lineas_ficha)
         mensaje_agente3 = f"Se procede a la búsqueda de los PDFs..."
         
         return {
@@ -410,6 +475,7 @@ def buscar_pdfs_node(state: AgentState):
             f"Exploración completada: Se localizó la carpeta '{carpeta}', pero está completamente vacía.\n"
             f"Asegúrate de arrastrar tus documentos científicos (.pdf) a esa ruta para poder proceder con el análisis. Se debe reiniciar el agente"
         )
+        mensajes = [AIMessage(content=mensaje_salida)]
     else:
         # Generamos una lista visual de los ficheros encontrados para que el usuario sepa cuáles se van a leer
         lista_ficheros = "\n".join([f"   📄 - {os.path.basename(f)}" for f in archivos])
@@ -419,13 +485,11 @@ def buscar_pdfs_node(state: AgentState):
         )
 
         mensaje_salida2 = f"Procediendo a la extracción de texto y metadatos..."
-        
+        mensajes = [AIMessage(content=mensaje_salida), AIMessage(content=mensaje_salida2)]
+
     return {
-        "trabajos_pdf": archivos, 
-        "messages": [
-            AIMessage(content=mensaje_salida),
-            AIMessage(content=mensaje_salida2)
-        ]
+        "trabajos_pdf": archivos,
+        "messages": mensajes
     }
 
 def leer_texto_node(state: AgentState):
@@ -521,8 +585,8 @@ TEXTO:
                  print(f"⚠️ Aviso: Posible sesgo en el problema del trabajo {i+1}")
             
             analizados.append(data)
-            reporte_titulos.append(f"   🔹 [{i+1}] {res.titulo[:60]}...")
-            print(f"✅ FINALIZADO: {res.titulo[:50]}...")
+            reporte_titulos.append(f"   🔹 [{i+1}] {_truncar_texto(res.titulo, 60)}")
+            print(f"✅ FINALIZADO: {_truncar_texto(res.titulo, 50)}")
         except Exception as e:
             print(f"❌ Error en trabajo {i+1}: {e}")
     
@@ -533,9 +597,47 @@ TEXTO:
         f"{lista_papers_analizados}\n" 
     )
 
+    # --- FICHAS TÉCNICAS EN MARKDOWN (para que gr.Chatbot las renderice legibles por campos, en
+    # vez del `repr()` en crudo de la lista de diccionarios) ---
+    def _cita_multilinea(texto):
+        lineas = (texto or "").strip().splitlines() or [""]
+        return [f"> {linea}" if linea.strip() else ">" for linea in lineas]
+
+    fichas_bloques = []
+    for idx, data in enumerate(analizados, 1):
+        autores = data.get("autores") or []
+        casos_uso = data.get("casos_uso") or []
+        lineas_ficha = [
+            f"#### {idx}. {data.get('titulo', '')}",
+            "",
+            f"**Autores:** {', '.join(autores) if autores else 'No especificado'}",
+            f"**Año:** {data.get('anio', '')}",
+            "",
+            "**Problema específico:**",
+            "",
+            *_cita_multilinea(data.get("problema_especifico")),
+            "",
+            "**Metodología:**",
+            "",
+            *_cita_multilinea(data.get("metodologia_detallada")),
+            "",
+            "**Aportaciones clave:**",
+            "",
+            *_cita_multilinea(data.get("aportaciones_clave")),
+            "",
+            "**Limitaciones críticas:**",
+            "",
+            *_cita_multilinea(data.get("limitaciones_criticas")),
+            "",
+            "**Casos de uso:**",
+            "",
+            *([f"- {c}" for c in casos_uso] if casos_uso else ["- No especificado"]),
+        ]
+        fichas_bloques.append("\n".join(lineas_ficha))
+
     mensaje_salida2 = (
-        f"Aqui se muestra la lista técnica de los trabajos analizados:\n"
-        f"{analizados}"
+        "### 🗂️ Fichas técnicas de los trabajos analizados\n\n"
+        + "\n\n---\n\n".join(fichas_bloques)
     )
 
     mensaje_salida3 = f"Avanzando al diseño de la sección de categorías..."
@@ -690,7 +792,7 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
     TEMA DEL PAPER DEL USUARIO: {tema}
     {bloque_reintento}
     ESTILO REQUERIDO:
-    1. NOMBRE CATEGORÍA: Máximo 5 palabras. Debe ser un concepto técnico de alto nivel (ej. 'Agentes Autónomos', 'Sistemas Multi-Agente', 'Arquitecturas LLM').
+    1. NOMBRE CATEGORÍA: Máximo 5 palabras. Debe ser un concepto técnico de alto nivel.
     2. NO uses frases como "Investigación sobre..." o "El trabajo de...".
     3. DESCRIPCIÓN: Una sola frase técnica y directa que describa la categoría, justificada por el contenido real de los trabajos que agrupa.
     4. En el campo "trabajos" de cada categoría, usa EXACTAMENTE el título de cada trabajo tal y como aparece en las fichas técnicas.
@@ -705,7 +807,7 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
         categorias_finales = []
 
         for cat in propuesta_dict['categorias']:
-            nombre_limpio = " ".join(cat['nombre'].split()[:5]).title()
+            nombre_limpio = cat['nombre'].strip().title()
             nombre_limpio = nombre_limpio.rstrip(".")
 
             validos = [t for t in cat['trabajos'] if t in titulos_reales and t not in asignados]
@@ -739,7 +841,7 @@ def proponer_categorias_node(state: AgentState) -> AgentState:
             lineas_propuesta.append(f"   *Descripción:* {cat['descripcion']}")
             lineas_propuesta.append("    *Artículos asociados:*")
             for t in cat['trabajos']:
-                lineas_propuesta.append(f"      - {t[:75]}...")
+                lineas_propuesta.append(f"      - {_truncar_texto(t, 75)}")
             lineas_propuesta.append("") # Línea en blanco de separación
 
         mensaje_final = "\n".join(lineas_propuesta)
@@ -870,10 +972,11 @@ def gateway_categorias(state: AgentState):
     return "confirmar_categorias"
 
 def modificar_categorias_node(state: AgentState) -> AgentState:
-    import json
 
     categorias = state["categorias_propuestas"]
     instrucciones = state.get("instrucciones_modificacion", "")
+    trabajos = state.get("trabajos_analizados", [])
+    titulos_reales = [t["titulo"] for t in trabajos]
 
     if isinstance(categorias, str):
         try:
@@ -887,71 +990,93 @@ def modificar_categorias_node(state: AgentState) -> AgentState:
             }
 
     prompt = f"""
-    Eres un asistente experto en organizar trabajos académicos. 
-    SÓLO debes devolver un objeto JSON válido con el mismo formato de entrada.
+Eres un editor de revistas científicas aplicando una edición QUIRÚRGICA sobre una taxonomía de
+categorías ya existente para la sección "Related Works". Tu única tarea es aplicar EXACTAMENTE los
+cambios que pide el usuario, sin rediseñar la taxonomía por tu cuenta.
 
-    Categorías actuales:
-    {json.dumps(categorias, indent=2, ensure_ascii=False)}
+CATEGORÍAS ACTUALES:
+{json.dumps(categorias, indent=2, ensure_ascii=False)}
 
-    Instrucciones de modificación dadas por el usuario:
-    "{instrucciones}"
+TÍTULOS VÁLIDOS DE LOS TRABAJOS (usa EXACTAMENTE estos títulos, tal cual, en el campo "trabajos"):
+{json.dumps(titulos_reales, indent=2, ensure_ascii=False)}
 
-    TAREA EXCLUSIVA:
-    - Modifica la estructura actual aplicando con total precisión las instrucciones del usuario.
-    - Mantén un máximo de 3 categorías en el resultado final.
-    - Cada trabajo debe quedar asignado a una única categoría.
-    - No inventes nuevos títulos de trabajos ni añadas categorías no solicitadas.
-    - Devuelve ÚNICAMENTE el bloque JSON, sin introducciones, saludos ni bloques de código markdown.
+INSTRUCCIONES DE MODIFICACIÓN DADAS POR EL USUARIO:
+"{instrucciones}"
 
-    FORMATO REQUERIDO:
-    {{
-      "categorias": [
-        {{
-          "nombre": "Nombre categoría",
-          "descripcion": "Descripción breve",
-          "trabajos": ["Título trabajo 1", "Título trabajo 2"]
-        }}
-      ]
-    }}
-    """
-    response = llm_simple.invoke(prompt)
+REGLAS DE EDICIÓN (OBLIGATORIAS):
+1. Identifica qué categoría(s) o trabajo(s) referencia la instrucción, incluso si el usuario no usa
+   el nombre exacto (usa la coincidencia más cercana por significado entre las categorías/trabajos
+   actuales).
+2. Aplica ÚNICAMENTE el cambio pedido. Cualquier categoría que la instrucción NO mencione ni afecte
+   debe devolverse EXACTAMENTE igual: mismo nombre, misma descripción y mismos trabajos, sin
+   reformular texto que nadie pidió tocar.
+3. Cada título de TÍTULOS VÁLIDOS debe quedar asignado a exactamente una categoría al final. No
+   dejes ningún trabajo sin categoría ni lo dupliques en varias.
+4. No inventes trabajos que no estén en TÍTULOS VÁLIDOS, ni inventes categorías nuevas si la
+   instrucción no lo pide explícitamente.
+5. Máximo 3 categorías en el resultado final, salvo que el usuario pida explícitamente más.
+6. Si creas o renombras una categoría, sigue este estilo: nombre de máximo 5 palabras y concepto
+   técnico de alto nivel (ej. "Agentes Autónomos", "Arquitecturas LLM"), nunca frases como
+   "Investigación sobre..." o "El trabajo de..."; descripción en una sola frase técnica y directa,
+   justificada por el contenido real de los trabajos que agrupa.
+7. Si la instrucción es ambigua o contradictoria y no puedes aplicarla con confianza razonable,
+   aplica la interpretación más conservadora (la que menos se aleje del esquema actual) en vez de
+   rediseñar la taxonomía por tu cuenta.
+"""
 
-    # Función para extraer JSON del texto del LLM
-    def extraer_json(texto: str):
-        try:
-            return json.loads(texto)
-        except json.JSONDecodeError:
-            # Intentar buscar JSON dentro del texto
-            import re
-            match = re.search(r'(\{.*\})', texto, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1))
-                except json.JSONDecodeError:
-                    return None
-            return None
-
-    nuevas = extraer_json(response.content)
-
-    if not nuevas or "categorias" not in nuevas:
+    try:
+        res = llm_complejo.with_structured_output(PropuestaCategorias).invoke(prompt)
+        propuesta_dict = res.model_dump()
+    except Exception as e:
+        print(f"⚠️ Error al modificar categorías: {e}")
         return {
-            "error": "El modelo no devolvió un formato JSON procesable.",
+            "error": f"Error al modificar categorías: {str(e)}",
             "messages": [
-                AIMessage(content="⚠️ No logré interpretar las modificaciones aplicadas en un formato estructurado seguro. Por favor, intenta reformular los cambios.")
+                AIMessage(content="⚠️ No logré interpretar las modificaciones solicitadas en un formato estructurado seguro. Por favor, intenta reformular los cambios.")
             ]
         }
+
+    # Misma red de seguridad que proponer_categorias_node: solo se aceptan títulos reales, sin
+    # duplicados entre categorías, y cualquier trabajo que se quede sin categoría (p. ej. porque el
+    # LLM lo olvidó al reasignar) se añade a la primera categoría en vez de perderse en silencio.
+    asignados = set()
+    categorias_finales = []
+    for cat in propuesta_dict["categorias"]:
+        nombre_limpio = cat["nombre"].strip().title().rstrip(".")
+        validos = [t for t in cat["trabajos"] if t in titulos_reales and t not in asignados]
+        if validos:
+            categorias_finales.append({
+                "nombre": nombre_limpio,
+                "descripcion": cat["descripcion"],
+                "trabajos": validos
+            })
+            asignados.update(validos)
+
+    faltantes = [t for t in titulos_reales if t not in asignados]
+    if faltantes and categorias_finales:
+        categorias_finales[0]["trabajos"].extend(faltantes)
+
+    if not categorias_finales:
+        return {
+            "error": "El modelo no devolvió categorías utilizables tras la modificación.",
+            "messages": [
+                AIMessage(content="⚠️ No logré aplicar las modificaciones solicitadas de forma consistente. Por favor, intenta reformular los cambios.")
+            ]
+        }
+
+    nuevas = {"categorias": categorias_finales}
 
     lineas_resultado = [
         "🛠️ **Modificaciones aplicadas con éxito.**",
         "A continuación tienes el esquema taxonómico actualizado según tus peticiones:\n"
     ]
 
-    for idx, cat in enumerate(nuevas.get('categorias', []), 1):
-        lineas_resultado.append(f"  📦 Nueva Categoría {idx}: **{cat.get('nombre')}**")
-        lineas_resultado.append(f"     💡 *Descripción:* {cat.get('descripcion')}")
+    for idx, cat in enumerate(nuevas["categorias"], 1):
+        lineas_resultado.append(f"  📦 Nueva Categoría {idx}: **{cat['nombre']}**")
+        lineas_resultado.append(f"     💡 *Descripción:* {cat['descripcion']}")
         lineas_resultado.append("     📄 *Artículos en esta sección:*")
-        for t in cat.get('trabajos', []):
-            lineas_resultado.append(f"        - {t[:75]}...")
+        for t in cat['trabajos']:
+            lineas_resultado.append(f"        - {_truncar_texto(t, 75)}")
         lineas_resultado.append("")
 
     mensaje_final = "\n".join(lineas_resultado)
@@ -1159,14 +1284,11 @@ def redactar_trabajos_relacionados_node(state: AgentState) -> AgentState:
         # Ajustamos el mensaje de log según el flujo ejecutado
         tipo_redaccion = "con estructura de categorías" if (categorias and hay_categorias) else "en formato secuencial lineal"
 
-        previsualizacion = "\n".join(texto_redactado.split("\n")[:8])
-        
         mensaje_salida = (
             f"Cuerpo del Estado del Arte redactado de forma autónoma.\n"
             f"El documento se ha generado utilizando un enfoque *{tipo_redaccion}*.\n\n"
-            f"Previsualización del manuscrito:\n"
-            f"{previsualizacion}\n"
-            f"   [... El texto continúa analizando de manera fluida el resto de las obras ...]\n\n"
+            f"Manuscrito generado:\n\n"
+            f"{texto_redactado}\n"
         )
 
         mensaje_final = f"Avanzando hacia la redacción de la tabla comparativa..."
@@ -1342,7 +1464,7 @@ explícitamente en la justificación final.
 FORMATO:
 
 {{
-  "columnas": [],
+  "columnas": ["Título", "..."],
   "incluye_trabajo_propio": true,
   "justificacion": ""
 }}
@@ -1350,6 +1472,7 @@ FORMATO:
 REGLAS:
 
 - SOLO JSON
+- "columnas" es una lista plana de STRINGS (solo el nombre de cada columna, p. ej. "Soporte de Big Data"). NUNCA un objeto/diccionario con el tipo u otros campos: la distinción descriptiva/binaria que has razonado arriba se refleja SOLO en cómo nombras la columna y se justifica en el campo "justificacion", no como una clave adicional en cada elemento de la lista
 - NO copies literalmente los nombres de los campos del JSON de trabajos_analizados (p. ej. "Autores", "Año", "Metodología detallada") como columnas; deriva criterios de comparación propios
 - 6-10 columnas en total, incluyendo "Título" (siempre la primera)
 - Las columnas deben ser distintas a las de la propuesta anterior (si existe)
@@ -1363,27 +1486,43 @@ Si no puedes → null
     for _ in range(3):
 
         res = llm_complejo.invoke(prompt)
-        nueva = extraer_json(res.content)
+        nueva = _normalizar_columnas(extraer_json(res.content))
 
         if not nueva:
             continue
 
         if not estructura_anterior or not estructuras_similares(estructura_anterior, nueva):
             
-            # --- CONSTRUCCIÓN DEL MENSAJE CONVERSACIONAL Y MENÚ ---
-            columnas_formateadas = ", ".join([f"[{c}]" for c in nueva.get("columnas", [])])
-            
+            # --- CONSTRUCCIÓN DEL MENSAJE CONVERSACIONAL Y MENÚ (Markdown, para que gr.Chatbot
+            # lo renderice de forma legible en vez de un bloque de texto plano) ---
+            columnas = nueva.get("columnas", [])
+            columnas_lista = [f"{i}. {c}" for i, c in enumerate(columnas, 1)]
+
+            justificacion = (nueva.get("justificacion") or "").strip()
+            justificacion_lineas = justificacion.splitlines() or ["(sin justificación proporcionada)"]
+            justificacion_cita = [f"> {linea}" if linea.strip() else ">" for linea in justificacion_lineas]
+
             lineas_mensaje = [
-                "Propuesta de Estructura para la Tabla Comparativa\n",
-                f" Columnas sugeridas: {columnas_formateadas}",
-                f" Justificación metodológica: {nueva.get('justificacion')}\n",
-                " ¿Qué deseas hacer con este diseño de tabla?",
-                "  [1] - Aceptar estructura y rellenar los datos automáticamente.",
-                "  [2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
-                "  [3] - Modificar o añadir columnas de forma personalizada.",
-                "  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
+                "### 📊 Propuesta de estructura para la tabla comparativa",
+                "",
+                f"**Columnas propuestas** ({len(columnas)} en total):",
+                "",
+                *columnas_lista,
+                "",
+                "**Justificación metodológica:**",
+                "",
+                *justificacion_cita,
+                "",
+                "---",
+                "",
+                "**¿Qué deseas hacer con este diseño de tabla?**",
+                "",
+                "[1] - Aceptar estructura y rellenar los datos automáticamente.",
+                "[2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
+                "[3] - Modificar o añadir columnas de forma personalizada.",
+                "[4] - Cancelar diseño de tabla y avanzar hacia la conclusión.",
             ]
-            
+
             return {
                 "estructura_tabla_propuesta": nueva,
                 "error": None,
@@ -1469,43 +1608,62 @@ def modificar_estructura_node(state: AgentState):
     instrucciones = state.get("instrucciones_tabla", "")
 
     prompt = f"""
-Eres un sistema que SOLO devuelve JSON válido.
+Eres un investigador aplicando una edición QUIRÚRGICA sobre el diseño ya acordado de la tabla
+comparativa de la sección "Related Works". Tu única tarea es aplicar EXACTAMENTE los cambios que
+pide el usuario sobre la estructura actual, sin rediseñarla desde cero.
 
-Estructura actual:
+ESTRUCTURA ACTUAL:
 {json.dumps(estructura_actual, indent=2, ensure_ascii=False)}
 
-Instrucciones del usuario:
-{instrucciones}
+INSTRUCCIONES DE MODIFICACIÓN DADAS POR EL USUARIO:
+"{instrucciones}"
 
-TAREA:
-Modificar la estructura de la tabla según las instrucciones del usuario.
+REGLAS DE EDICIÓN (OBLIGATORIAS):
+1. Identifica qué columna(s) referencia la instrucción, incluso si el usuario no usa el nombre
+   exacto (usa la coincidencia más cercana por significado entre las columnas actuales).
+2. Aplica ÚNICAMENTE el cambio pedido. Cualquier columna que la instrucción NO mencione debe
+   mantenerse EXACTAMENTE igual, con el mismo nombre y en el mismo orden relativo.
+3. Si el usuario pide quitar una columna, elimínala y no la sustituyas por otra salvo que lo pida
+   explícitamente.
+4. Si el usuario pide añadir una columna nueva, decide de forma razonada si por su naturaleza debe
+   ser una columna DESCRIPTIVA (propiedad cualitativa que perdería información relevante si se
+   redujera a Sí/No) o una columna de CAPACIDAD BINARIA (hecho técnico verificable que cada trabajo
+   cumple o no cumple, nombrada como una capacidad afirmable, nunca como una pregunta).
+5. Si el usuario pide explícitamente "nuevas columnas" o "rediseñar" sin más detalle, sí puedes
+   sustituir el conjunto completo por uno nuevo, manteniendo el mismo criterio descriptiva/binaria
+   razonado en el punto 4 para cada columna.
+6. "Título" es siempre la primera columna y nunca se elimina salvo instrucción explícita en sentido
+   contrario.
+7. No cambies el número total de columnas más allá de lo que la instrucción implique directamente
+   (p. ej. si pide quitar una y añadir otra, el total se mantiene; si solo pide quitar, el total
+   baja en consecuencia).
+8. Si la instrucción es ambigua o contradictoria y no puedes aplicarla con confianza razonable,
+   aplica la interpretación más conservadora (la que menos se aleje de la estructura actual) en vez
+   de rediseñar la tabla por tu cuenta.
 
-REGLAS:
-- NO inventar columnas fuera de las instrucciones si son explícitas
-- SI el usuario pide "nuevas columnas", rediseñar completamente
-- Mantener entre 5 y 8 columnas
-- Mantener formato correcto
-
-FORMATO:
+FORMATO DE SALIDA OBLIGATORIO:
 
 {{
-  "columnas": [],
+  "columnas": ["Título", "..."],
   "incluye_trabajo_propio": true,
   "justificacion": ""
 }}
 
-IMPORTANTE:
-- Devuelve SOLO JSON
-- Justificación obligatoria (mínimo 4 líneas)
-- NO texto fuera del JSON
+REGLAS DE FORMATO:
+- SOLO JSON, sin texto ni bloques de código markdown alrededor
+- "columnas" es una lista plana de STRINGS (solo el nombre de cada columna). NUNCA un objeto con el
+  tipo u otros campos: la distinción descriptiva/binaria del punto 4 se refleja en el nombre y se
+  explica en la justificación, no como una clave adicional
+- justificación obligatoria (mínimo 3 líneas): qué cambiaste, por qué, y por qué el resto de
+  columnas se mantiene igual
 
 Si no puedes generar JSON válido → devuelve null
 """
 
-    res = llm_simple.invoke(prompt)
-    nueva = extraer_json(res.content)
+    res = llm_complejo.invoke(prompt)
+    nueva = _normalizar_columnas(extraer_json(res.content))
 
-    if not nueva or "columnas" not in nueva:
+    if not nueva or not nueva.get("columnas"):
         return {
             "error": "El modelo no generó un JSON de estructura válido.",
             "messages": [
@@ -1513,30 +1671,40 @@ Si no puedes generar JSON válido → devuelve null
             ]
         }
 
-    # --- REPORTE VISUAL UNIFICADO EN UN ÚNICO MENSAJE ---
-    columnas_actualizadas = ", ".join([f"[{c}]" for c in nueva.get("columnas", [])])
-    
-    lineas_mensaje = [
-        " Esquema de la tabla modificado y personalizado correctamente.",
-        f" Columnas finales de la matriz: {columnas_actualizadas}",
-        f" Nueva justificación de diseño: {nueva.get('justificacion')}\n",
-    ]
+    # --- CONSTRUCCIÓN DEL MENSAJE CONVERSACIONAL Y MENÚ (mismo formato Markdown que
+    # proponer_estructura_node, para que gr.Chatbot lo renderice de forma consistente) ---
+    columnas = nueva.get("columnas", [])
+    columnas_lista = [f"{i}. {c}" for i, c in enumerate(columnas, 1)]
 
-    mensaje_final = (
-        f" ¿Qué deseas hacer con este diseño de tabla?",
-            f"  [1] - Aceptar estructura y rellenar los datos automáticamente.",
-            f"  [2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
-            f"  [3] - Modificar o añadir columnas de forma personalizada.",
-            f"  [4] - Cancelar diseño de tabla y avanzar hacia la conclusión."
-    )
+    justificacion = (nueva.get("justificacion") or "").strip()
+    justificacion_lineas = justificacion.splitlines() or ["(sin justificación proporcionada)"]
+    justificacion_cita = [f"> {linea}" if linea.strip() else ">" for linea in justificacion_lineas]
+
+    lineas_mensaje = [
+        "### 📊 Estructura de la tabla comparativa modificada",
+        "",
+        f"**Columnas actualizadas** ({len(columnas)} en total):",
+        "",
+        *columnas_lista,
+        "",
+        "**Justificación metodológica:**",
+        "",
+        *justificacion_cita,
+        "",
+        "---",
+        "",
+        "**¿Qué deseas hacer con este diseño de tabla?**",
+        "",
+        "[1] - Aceptar estructura y rellenar los datos automáticamente.",
+        "[2] - Pedir una nueva estructura (el agente evaluará qué columnas actuales conviene cambiar).",
+        "[3] - Modificar o añadir columnas de forma personalizada.",
+        "[4] - Cancelar diseño de tabla y avanzar hacia la conclusión.",
+    ]
 
     return {
         "estructura_tabla_propuesta": nueva,
         "error": None,
-        "messages": [
-            AIMessage(content="\n".join(lineas_mensaje)),
-            AIMessage(content=mensaje_final),
-        ]
+        "messages": [AIMessage(content="\n".join(lineas_mensaje))]
     }
 
 def gateway_estructura(state: AgentState):
