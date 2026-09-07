@@ -181,7 +181,7 @@ decisión anterior.
 ```
 TFG_Agente_AsistenteRedaccion/
 ├── requirements.txt              # Dependencias de Python
-├── trabajos_relacionados/        # PDFs de los trabajos relacionados a analizar
+├── trabajos_relacionados/        # (no versionado) PDFs de los trabajos relacionados a analizar
 └── src/
     ├── app1.py                   # Backend completo: estado, nodos, gateways y grafo de LangGraph
     ├── gui.py                    # Interfaz web (Gradio) sobre el grafo compilado en app1.py
