@@ -1,4 +1,4 @@
-# 📚 AI Related Works Agent
+# AI Related Works Agent
 
 Agente de IA basado en **LangGraph** que entrevista al usuario sobre su propio trabajo de
 investigación, analiza un conjunto de PDFs de trabajos relacionados y redacta automáticamente la
@@ -39,7 +39,7 @@ Desarrollado como Trabajo de Fin de Grado (TFG).
 
 ---
 
-## 📖 Descripción
+## Descripción
 
 Redactar la sección "Related Works" de un paper es una tarea repetitiva y que consume mucho
 tiempo: hay que leer cada trabajo relacionado, extraer su aportación, compararlo con el trabajo
@@ -62,26 +62,26 @@ El agente funciona como una **máquina de estados de LangGraph**, con dos interf
 intercambiables sobre el mismo grafo compilado: un cliente de consola y una interfaz web local
 con Gradio.
 
-## ✨ Características principales
+## Características principales
 
-- 🌐 Salida en **español o inglés académico**, configurable al inicio de cada sesión.
-- 📄 Análisis automático de cualquier número de PDFs colocados en una carpeta, sin pasos manuales
+- Salida en **español o inglés académico**, configurable al inicio de cada sesión.
+- Análisis automático de cualquier número de PDFs colocados en una carpeta, sin pasos manuales
   de extracción.
-- 🗂️ **Categorización opcional** de los trabajos en una taxonomía de hasta 3 categorías, con
+- **Categorización opcional** de los trabajos en una taxonomía de hasta 3 categorías, con
   ciclo de propuesta → aceptar / regenerar / modificar / rechazar.
-- 📊 **Tabla comparativa opcional**, con el LLM decidiendo de forma razonada qué columnas deben
+- **Tabla comparativa opcional**, con el LLM decidiendo de forma razonada qué columnas deben
   ser descriptivas y cuáles binarias (Sí/No) según lo que mejor diferencie a los trabajos
   analizados — mismo ciclo de propuesta/confirmación que las categorías.
-- 🧩 **2 slots de modelo LLM configurables** (tareas "simples" y "complejas"), cada uno apuntando
+- **2 slots de modelo LLM configurables** (tareas "simples" y "complejas"), cada uno apuntando
   a un modelo local de Ollama o a un proveedor por API (Google Gemini, OpenAI, Anthropic Claude),
   configurables sin tocar código desde la propia interfaz web.
-- 📝 **Ensamblado LaTeX robusto**: además de la redacción por LLM, una batería de
+- **Ensamblado LaTeX robusto**: además de la redacción por LLM, una batería de
   post-procesados deterministas garantiza que la tabla comparativa siempre quepa en una única
   página, que las columnas ajusten el texto en vez de desbordarse, que el orden de las secciones
   sea siempre el correcto, etc.
-- 💾 Guardado automático del estado completo de la sesión y del documento LaTeX final al terminar.
+- Guardado automático del estado completo de la sesión y del documento LaTeX final al terminar.
 
-## 🧠 Arquitectura del agente
+## Arquitectura del agente
 
 El agente está implementado en un único fichero (`src/app1.py`) usando
 [`langgraph.graph.StateGraph`](https://langchain-ai.github.io/langgraph/). No hay separación en
@@ -176,7 +176,7 @@ Las decisiones de enrutado entre nodos las toman 4 funciones **gateway** (`gatew
 `graph.add_conditional_edges(...)`, que leen las banderas dejadas en el estado por el nodo de
 decisión anterior.
 
-## 🗂️ Estructura del proyecto
+## Estructura del proyecto
 
 ```
 TFG_Agente_AsistenteRedaccion/
@@ -195,7 +195,7 @@ TFG_Agente_AsistenteRedaccion/
 Al finalizar una ejecución también se genera `related_works.tex` en el directorio desde el que se
 lanzó el script, con el fragmento LaTeX final listo para pegar en el paper.
 
-## ⚙️ Requisitos previos
+## Requisitos previos
 
 - **Python 3.10+** (probado con Python 3.12).
 - Al menos **un motor LLM** disponible para cada uno de los 2 slots configurables:
@@ -207,7 +207,7 @@ lanzó el script, con el fragmento LaTeX final listo para pegar en el paper.
 - Al menos **un PDF** en `trabajos_relacionados/` para poder analizar algo (el repositorio incluye
   varios PDFs de ejemplo sobre simuladores IoT/WSN que puedes sustituir por los tuyos).
 
-## 🚀 Instalación
+## Instalación
 
 1. Clona el repositorio:
 
@@ -243,7 +243,7 @@ lanzó el script, con el fragmento LaTeX final listo para pegar en el paper.
    repositorio, junto a `src/`). Si la carpeta no existe todavía, el propio agente la crea en su
    primera ejecución y te pide que añadas los PDFs y vuelvas a arrancar.
 
-## 🔧 Configuración
+## Configuración
 
 ### Modelos LLM
 
@@ -307,7 +307,7 @@ desde la interfaz web (⚙️ Ajustes → **Variables de entorno**).
 analizar. Se puede gestionar a mano o desde la interfaz web (⚙️ Ajustes → **Documentos**), que
 permite subir y eliminar PDFs sin tocar el sistema de archivos manualmente.
 
-## ▶️ Uso
+## Uso
 
 ### Antes de empezar
 
@@ -356,7 +356,7 @@ Levanta un servidor Gradio local (la URL se imprime por consola, normalmente
 Ambas interfaces comparten el mismo grafo compilado y producen exactamente los mismos resultados
 — no existe un modo no interactivo/headless.
 
-## 🧭 Flujo de uso paso a paso
+## Flujo de uso paso a paso
 
 1. **Idioma**: eliges si el documento final se redacta en español o inglés académico.
 2. **Tu paper**: describes en lenguaje natural de qué trata tu trabajo, su metodología y su
@@ -378,7 +378,7 @@ Ambas interfaces comparten el mismo grafo compilado y producen exactamente los m
 8. **Ensamblado final**: todo se revisa, homogeneiza y fusiona en un único documento LaTeX con
    citas `\cite{ref-N}` y bibliografía generada automáticamente.
 
-## 📄 Salidas generadas
+## Salidas generadas
 
 Al llegar al final del flujo se guardan automáticamente:
 
@@ -387,7 +387,7 @@ Al llegar al final del flujo se guardan automáticamente:
 - **`related_works.tex`** — el fragmento LaTeX final, en el directorio desde el que se ejecutó el
   script, listo para copiar y pegar en el documento del paper.
 
-## 🖼️ Generar el diagrama del grafo
+## Generar el diagrama del grafo
 
 ```bash
 python src/generar_diagrama_grafo.py
@@ -398,7 +398,7 @@ Genera `grafo_agente.png` en la raíz del repositorio a partir del grafo real co
 conexión a internet). Si falla, guarda como alternativa el texto Mermaid en `grafo_agente.mmd`,
 que se puede pegar en [mermaid.live](https://mermaid.live).
 
-## 🛠️ Tecnologías utilizadas
+## Tecnologías utilizadas
 
 - **[LangGraph](https://langchain-ai.github.io/langgraph/)** — máquina de estados del agente,
   con checkpointing en memoria (`MemorySaver`) y pausas vía `interrupt()`.
@@ -412,7 +412,7 @@ que se puede pegar en [mermaid.live](https://mermaid.live).
 - **[Gradio](https://www.gradio.dev/)** — interfaz web local.
 - **`python-dotenv`** — carga de variables de entorno desde `src/.env`.
 
-## ⚠️ Limitaciones conocidas
+## Limitaciones conocidas
 
 - El estado de la conversación se guarda **solo en memoria** (`MemorySaver`): si el proceso se
   reinicia a mitad de una sesión, esa sesión se pierde (aunque `state_guardado.json` se genera al
@@ -424,11 +424,11 @@ que se puede pegar en [mermaid.live](https://mermaid.live).
 - No hay una suite de tests automatizada: verificar un cambio implica ejecutar el agente de
   extremo a extremo (consola o interfaz web) y recorrer el flujo manualmente.
 
-## 👤 Autor
+## Autor
 
 **Sergio Durán Pérez** — Trabajo de Fin de Grado (TFG).
 
-## 📜 Licencia
+## Licencia
 
 Este proyecto está licenciado bajo la [Licencia MIT](LICENSE) — puedes usar, modificar y
 distribuir el código libremente, citando la autoría original. Esta licencia cubre el código
