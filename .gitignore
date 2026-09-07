@@ -1,12 +1,16 @@
 .env
 src/llm_config.json
-src/state_guardado.json
+src/state_guardado*.json
 related_works.tex
 CLAUDE.md
 .claudeignore
 grafo_agente.png
+trabajos_relacionados/
 
 __pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.py[cod]
 *$py.class
 *.so

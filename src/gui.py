@@ -48,6 +48,8 @@ from app1 import (  # noqa: E402
     LIMITE_CARACTERES_ANALISIS_DEFECTO,
 )
 
+# ---- Constantes ----
+
 CLAVES_ENV = sorted({info["api_key_env"] for info in PROVEEDORES_LLM.values() if info["api_key_env"]})
 
 MENSAJE_FINALIZADO = (
@@ -63,7 +65,7 @@ en LaTeX con sus `\\cite{}` y la bibliografía ya generada.
 """
 
 
-# ---- Historial de chat ----
+# ---- Motor de la conversación ----
 
 def mensajes_a_historial(mensajes):
     """Convierte AgentState['messages'] al formato de mensajes que espera gr.Chatbot."""
@@ -77,6 +79,8 @@ def mensajes_a_historial(mensajes):
 
 
 def nueva_configuracion():
+    """Genera un `config` de LangGraph nuevo (con un `thread_id` aleatorio), necesario para
+    arrancar una sesión del grafo independiente de cualquier otra."""
     return {"configurable": {"thread_id": str(uuid.uuid4())}}
 
 
@@ -115,6 +119,147 @@ def ejecutar_hasta_pausa(entrada, config):
     yield historial, True
 
 
+def manejar_envio(mensaje, config):
+    """Maneja el envío de un mensaje del usuario en el chat: reanuda el grafo con
+    `Command(resume=mensaje)` y va emitiendo el historial actualizado hasta la siguiente pausa,
+    dejando la caja de texto interactiva o no según si el proceso ha terminado."""
+    if not config or not mensaje or not mensaje.strip():
+        yield gr.update(), gr.update(value="")
+        return
+
+    historial = []
+    terminado = False
+    for historial, terminado in ejecutar_hasta_pausa(Command(resume=mensaje), config):
+        yield historial, gr.update(value="")
+    yield historial, gr.update(
+        value="",
+        interactive=not terminado,
+        placeholder="Proceso finalizado." if terminado else "Escribe aquí tu respuesta...",
+    )
+
+
+# ---- Página de ajustes: PDFs ----
+
+def _listar_pdfs():
+    """Devuelve los nombres (ordenados) de los `.pdf` que hay actualmente en
+    `trabajos_relacionados/`, creando la carpeta si todavía no existe."""
+    os.makedirs(CARPETA_PDFS, exist_ok=True)
+    return sorted(f for f in os.listdir(CARPETA_PDFS) if f.lower().endswith(".pdf"))
+
+
+def refrescar_lista_pdfs():
+    """Reconstruye el `gr.update` del `CheckboxGroup` de PDFs con la lista actual de disco y la
+    selección vacía."""
+    return gr.update(choices=_listar_pdfs(), value=[])
+
+
+def anadir_pdfs(archivos):
+    """Copia los `archivos` subidos por el usuario a `trabajos_relacionados/` y devuelve la
+    lista de PDFs actualizada junto con un mensaje de confirmación."""
+    if not archivos:
+        return gr.update(choices=_listar_pdfs()), gr.update(), None
+
+    os.makedirs(CARPETA_PDFS, exist_ok=True)
+    copiados = []
+    for ruta in archivos:
+        destino = os.path.join(CARPETA_PDFS, os.path.basename(ruta))
+        shutil.copy(ruta, destino)
+        copiados.append(os.path.basename(ruta))
+
+    mensaje = f"✅ Añadido(s) {len(copiados)} PDF(s): {', '.join(copiados)}"
+    return gr.update(choices=_listar_pdfs(), value=[]), mensaje, None
+
+
+def eliminar_pdfs(seleccionados):
+    """Borra de `trabajos_relacionados/` los PDFs marcados en `seleccionados` y devuelve la
+    lista actualizada junto con un mensaje de confirmación."""
+    if not seleccionados:
+        return gr.update(choices=_listar_pdfs(), value=[]), "⚠️ No se ha seleccionado ningún PDF para eliminar."
+
+    for nombre in seleccionados:
+        ruta = os.path.join(CARPETA_PDFS, nombre)
+        if os.path.exists(ruta):
+            os.remove(ruta)
+
+    return gr.update(choices=_listar_pdfs(), value=[]), f"🗑️ Eliminado(s): {', '.join(seleccionados)}"
+
+
+# ---- Página de ajustes: src/.env ----
+
+def cargar_valores_env():
+    """Lee `src/.env` (si existe) y devuelve los valores actuales de `CLAVES_ENV`, en ese mismo
+    orden, para precargar los textboxes de Ajustes."""
+    valores = dotenv_values(RUTA_ENV) if os.path.exists(RUTA_ENV) else {}
+    return [valores.get(clave, "") or "" for clave in CLAVES_ENV]
+
+
+def guardar_env(*valores):
+    """Escribe `src/.env` desde cero con `valores` (uno por cada clave de `CLAVES_ENV`, en ese
+    orden) y también los refleja en `os.environ` del proceso actual, para que un slot LLM
+    todavía no resuelto (ver `LLMPerezoso` en `app1.py`) pueda recogerlos sin reiniciar."""
+    contenido = "\n".join(f"{clave}={valor}" for clave, valor in zip(CLAVES_ENV, valores)) + "\n"
+    with open(RUTA_ENV, "w", encoding="utf-8") as f:
+        f.write(contenido)
+
+    # Reflejamos también los valores en el proceso actual: si el LLM correspondiente
+    # todavía no se ha resuelto (ver LLMPerezoso en app1.py), la clave nueva se
+    # recogerá sin necesidad de reiniciar la aplicación.
+    for clave, valor in zip(CLAVES_ENV, valores):
+        if valor:
+            os.environ[clave] = valor
+
+    return (
+        f"✅ Variables guardadas en `src/.env` ({', '.join(CLAVES_ENV)}). "
+        "Si algún modelo ya se había usado en esta sesión, reinicia la aplicación "
+        "(`python src/gui.py`) para que recoja la clave nueva."
+    )
+
+
+# ---- Página de ajustes: modelos LLM ----
+
+OPCIONES_PROVEEDOR = [(info["etiqueta"], clave) for clave, info in PROVEEDORES_LLM.items()]
+
+
+def cargar_valores_modelos_llm():
+    """Lee `src/llm_config.json` (vía `cargar_configuracion_llms`) y devuelve, en el orden que
+    esperan los controles de Ajustes, los valores de proveedor/modelo/temperature de ambos
+    slots más el límite de caracteres de análisis."""
+    config = cargar_configuracion_llms()
+    simple = config["simple"]
+    complejo = config["complejo"]
+    return (
+        simple.get("proveedor", "ollama"),
+        simple.get("modelo", ""),
+        simple.get("temperature", 0.1),
+        complejo.get("proveedor", "google_genai"),
+        complejo.get("modelo", ""),
+        complejo.get("temperature", 0.3),
+        config.get("limite_caracteres_analisis", LIMITE_CARACTERES_ANALISIS_DEFECTO),
+    )
+
+
+def guardar_modelos_llm(
+    proveedor_simple, modelo_simple, temp_simple,
+    proveedor_complejo, modelo_complejo, temp_complejo,
+    limite_caracteres_analisis,
+):
+    """Construye la configuración de ambos slots LLM a partir de los valores de los controles de
+    Ajustes y la persiste en `src/llm_config.json` (vía `guardar_configuracion_llms`)."""
+    config = {
+        "simple": {"proveedor": proveedor_simple, "modelo": modelo_simple.strip(), "temperature": temp_simple},
+        "complejo": {"proveedor": proveedor_complejo, "modelo": modelo_complejo.strip(), "temperature": temp_complejo},
+        "limite_caracteres_analisis": int(limite_caracteres_analisis),
+    }
+    guardar_configuracion_llms(config)
+    return (
+        "✅ Configuración de modelos guardada en `src/llm_config.json`. "
+        "Si esta sesión ya había ejecutado el agente, reinicia la aplicación "
+        "(`python src/gui.py`) para que los nuevos modelos se apliquen."
+    )
+
+
+# ---- Navegación entre páginas ----
+
 def comenzar_y_iniciar():
     """
     Combina en un único evento encadenado el cambio de página y el arranque del grafo.
@@ -144,126 +289,6 @@ def comenzar_y_iniciar():
         ),
     )
 
-
-def manejar_envio(mensaje, config):
-    if not config or not mensaje or not mensaje.strip():
-        yield gr.update(), gr.update(value="")
-        return
-
-    historial = []
-    terminado = False
-    for historial, terminado in ejecutar_hasta_pausa(Command(resume=mensaje), config):
-        yield historial, gr.update(value="")
-    yield historial, gr.update(
-        value="",
-        interactive=not terminado,
-        placeholder="Proceso finalizado." if terminado else "Escribe aquí tu respuesta...",
-    )
-
-
-# ---- Página de ajustes: PDFs ----
-
-def _listar_pdfs():
-    os.makedirs(CARPETA_PDFS, exist_ok=True)
-    return sorted(f for f in os.listdir(CARPETA_PDFS) if f.lower().endswith(".pdf"))
-
-
-def refrescar_lista_pdfs():
-    return gr.update(choices=_listar_pdfs(), value=[])
-
-
-def anadir_pdfs(archivos):
-    if not archivos:
-        return gr.update(choices=_listar_pdfs()), gr.update(), None
-
-    os.makedirs(CARPETA_PDFS, exist_ok=True)
-    copiados = []
-    for ruta in archivos:
-        destino = os.path.join(CARPETA_PDFS, os.path.basename(ruta))
-        shutil.copy(ruta, destino)
-        copiados.append(os.path.basename(ruta))
-
-    mensaje = f"✅ Añadido(s) {len(copiados)} PDF(s): {', '.join(copiados)}"
-    return gr.update(choices=_listar_pdfs(), value=[]), mensaje, None
-
-
-def eliminar_pdfs(seleccionados):
-    if not seleccionados:
-        return gr.update(choices=_listar_pdfs(), value=[]), "⚠️ No se ha seleccionado ningún PDF para eliminar."
-
-    for nombre in seleccionados:
-        ruta = os.path.join(CARPETA_PDFS, nombre)
-        if os.path.exists(ruta):
-            os.remove(ruta)
-
-    return gr.update(choices=_listar_pdfs(), value=[]), f"🗑️ Eliminado(s): {', '.join(seleccionados)}"
-
-
-# ---- Página de ajustes: src/.env ----
-
-def cargar_valores_env():
-    valores = dotenv_values(RUTA_ENV) if os.path.exists(RUTA_ENV) else {}
-    return [valores.get(clave, "") or "" for clave in CLAVES_ENV]
-
-
-def guardar_env(*valores):
-    contenido = "\n".join(f"{clave}={valor}" for clave, valor in zip(CLAVES_ENV, valores)) + "\n"
-    with open(RUTA_ENV, "w", encoding="utf-8") as f:
-        f.write(contenido)
-
-    # Reflejamos también los valores en el proceso actual: si el LLM correspondiente
-    # todavía no se ha resuelto (ver LLMPerezoso en app1.py), la clave nueva se
-    # recogerá sin necesidad de reiniciar la aplicación.
-    for clave, valor in zip(CLAVES_ENV, valores):
-        if valor:
-            os.environ[clave] = valor
-
-    return (
-        f"✅ Variables guardadas en `src/.env` ({', '.join(CLAVES_ENV)}). "
-        "Si algún modelo ya se había usado en esta sesión, reinicia la aplicación "
-        "(`python src/gui.py`) para que recoja la clave nueva."
-    )
-
-
-# ---- Página de ajustes: modelos LLM ----
-
-OPCIONES_PROVEEDOR = [(info["etiqueta"], clave) for clave, info in PROVEEDORES_LLM.items()]
-
-
-def cargar_valores_modelos_llm():
-    config = cargar_configuracion_llms()
-    simple = config["simple"]
-    complejo = config["complejo"]
-    return (
-        simple.get("proveedor", "ollama"),
-        simple.get("modelo", ""),
-        simple.get("temperature", 0.1),
-        complejo.get("proveedor", "google_genai"),
-        complejo.get("modelo", ""),
-        complejo.get("temperature", 0.3),
-        config.get("limite_caracteres_analisis", LIMITE_CARACTERES_ANALISIS_DEFECTO),
-    )
-
-
-def guardar_modelos_llm(
-    proveedor_simple, modelo_simple, temp_simple,
-    proveedor_complejo, modelo_complejo, temp_complejo,
-    limite_caracteres_analisis,
-):
-    config = {
-        "simple": {"proveedor": proveedor_simple, "modelo": modelo_simple.strip(), "temperature": temp_simple},
-        "complejo": {"proveedor": proveedor_complejo, "modelo": modelo_complejo.strip(), "temperature": temp_complejo},
-        "limite_caracteres_analisis": int(limite_caracteres_analisis),
-    }
-    guardar_configuracion_llms(config)
-    return (
-        "✅ Configuración de modelos guardada en `src/llm_config.json`. "
-        "Si esta sesión ya había ejecutado el agente, reinicia la aplicación "
-        "(`python src/gui.py`) para que los nuevos modelos se apliquen."
-    )
-
-
-# ---- Navegación entre páginas ----
 
 def mostrar_ajustes_y_cargar():
     """
